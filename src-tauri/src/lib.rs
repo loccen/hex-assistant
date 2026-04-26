@@ -339,6 +339,7 @@ where
     }
 }
 
+#[cfg(not(windows))]
 fn failed_attempt(
     strategy: &str,
     target_label: &str,
@@ -598,8 +599,8 @@ mod platform {
         let height = monitor.height().map_err(|err| err.to_string())?;
         let region_width = width.min(640);
         let region_height = height.min(360);
-        let x = ((width as i32) - (region_width as i32)) / 2;
-        let y = ((height as i32) - (region_height as i32)) / 2;
+        let x = (width - region_width) / 2;
+        let y = (height - region_height) / 2;
         let image = monitor
             .capture_region(x, y, region_width, region_height)
             .map_err(|err| err.to_string())?;

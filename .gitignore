@@ -3,6 +3,7 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 src-tauri/.tauri/
+artifacts/
 .DS_Store
 *.log
 *.tmp
