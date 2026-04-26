@@ -1,0 +1,339 @@
+import React, { useEffect, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { invoke } from "@tauri-apps/api/core";
+import "./styles.css";
+
+type CaptureTargetKind = "primaryMonitor" | "lolWindow" | "foregroundWindow";
+
+type RectInfo = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+type CaptureTarget = {
+  kind: string;
+  id: string;
+  label: string;
+  bounds?: RectInfo | null;
+  isLolCandidate: boolean;
+};
+
+type ProcessInfo = {
+  pid: string;
+  name: string;
+};
+
+type EnvironmentSnapshot = {
+  os: string;
+  arch: string;
+  family: string;
+  appDataDir: string;
+  rustTargetOs: string;
+  rustTargetArch: string;
+  lolProcesses: ProcessInfo[];
+};
+
+type PixelMetrics = {
+  averageLuma: number;
+  lumaVariance: number;
+  nearBlackRatio: number;
+  sampledPixels: number;
+};
+
+type CaptureAttempt = {
+  strategy: string;
+  targetLabel: string;
+  startedAt: string;
+  durationMs: number;
+  status: "success" | "failed" | string;
+  width?: number | null;
+  height?: number | null;
+  savedPath?: string | null;
+  imageHash?: string | null;
+  blackScreenSuspected?: boolean | null;
+  metrics?: PixelMetrics | null;
+  error?: string | null;
+};
+
+type DiagnosticReport = {
+  id: string;
+  createdAt: string;
+  environment: EnvironmentSnapshot;
+  targets: CaptureTarget[];
+  attempts: CaptureAttempt[];
+  summary: string;
+  reportDir: string;
+  logPath: string;
+  jsonPath: string;
+};
+
+const targetOptions: Array<{ value: CaptureTargetKind; label: string; hint: string }> = [
+  {
+    value: "primaryMonitor",
+    label: "主显示器",
+    hint: "适合 LOL 独占全屏和无边框场景",
+  },
+  {
+    value: "lolWindow",
+    label: "LOL 窗口",
+    hint: "按窗口标题寻找 League of Legends / 英雄联盟",
+  },
+  {
+    value: "foregroundWindow",
+    label: "当前前台窗口",
+    hint: "你把 LOL 切到最前面后再运行",
+  },
+];
+
+function App() {
+  const [target, setTarget] = useState<CaptureTargetKind>("primaryMonitor");
+  const [saveSamples, setSaveSamples] = useState(true);
+  const [environment, setEnvironment] = useState<EnvironmentSnapshot | null>(null);
+  const [targets, setTargets] = useState<CaptureTarget[]>([]);
+  const [report, setReport] = useState<DiagnosticReport | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refresh();
+  }, []);
+
+  async function refresh() {
+    setError(null);
+    try {
+      const [env, captureTargets] = await Promise.all([
+        invoke<EnvironmentSnapshot>("get_environment_snapshot"),
+        invoke<CaptureTarget[]>("list_capture_targets"),
+      ]);
+      setEnvironment(env);
+      setTargets(captureTargets);
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function runDiagnostic() {
+    setLoading(true);
+    setError(null);
+    try {
+      const result = await invoke<DiagnosticReport>("run_capture_diagnostic", {
+        request: {
+          target,
+          saveSamples,
+        },
+      });
+      setReport(result);
+      setEnvironment(result.environment);
+      setTargets(result.targets);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const lolTargets = useMemo(
+    () => targets.filter((item) => item.isLolCandidate),
+    [targets],
+  );
+
+  return (
+    <main className="app-shell">
+      <section className="top-bar">
+        <div>
+          <h1>LOL 海克斯乱斗助手截图诊断</h1>
+          <p>第一阶段只验证全屏、无边框、窗口模式下能否稳定截图，并导出日志和样本。</p>
+        </div>
+        <button className="ghost-button" onClick={refresh} disabled={loading}>
+          刷新环境
+        </button>
+      </section>
+
+      {error ? <div className="error-strip">{error}</div> : null}
+
+      <section className="workspace">
+        <aside className="control-panel">
+          <h2>诊断目标</h2>
+          <div className="target-list">
+            {targetOptions.map((option) => (
+              <label
+                key={option.value}
+                className={option.value === target ? "target-option selected" : "target-option"}
+              >
+                <input
+                  type="radio"
+                  name="target"
+                  value={option.value}
+                  checked={target === option.value}
+                  onChange={() => setTarget(option.value)}
+                />
+                <span>
+                  <strong>{option.label}</strong>
+                  <small>{option.hint}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={saveSamples}
+              onChange={(event) => setSaveSamples(event.currentTarget.checked)}
+            />
+            保存截图样本
+          </label>
+
+          <button className="primary-button" onClick={runDiagnostic} disabled={loading}>
+            {loading ? "诊断中..." : "运行截图诊断"}
+          </button>
+
+          {report ? (
+            <div className="export-box">
+              <strong>导出位置</strong>
+              <span>{report.reportDir}</span>
+              <span>日志：{report.logPath}</span>
+              <span>JSON：{report.jsonPath}</span>
+            </div>
+          ) : null}
+        </aside>
+
+        <section className="content-panel">
+          <EnvironmentView environment={environment} targets={targets} lolTargets={lolTargets} />
+          {report ? <ReportView report={report} /> : <EmptyState />}
+        </section>
+      </section>
+    </main>
+  );
+}
+
+function EnvironmentView({
+  environment,
+  targets,
+  lolTargets,
+}: {
+  environment: EnvironmentSnapshot | null;
+  targets: CaptureTarget[];
+  lolTargets: CaptureTarget[];
+}) {
+  return (
+    <section className="info-grid">
+      <div className="info-panel">
+        <h2>运行环境</h2>
+        {environment ? (
+          <dl>
+            <dt>系统</dt>
+            <dd>{environment.os}</dd>
+            <dt>目标</dt>
+            <dd>
+              {environment.rustTargetOs} / {environment.rustTargetArch}
+            </dd>
+            <dt>数据目录</dt>
+            <dd>{environment.appDataDir}</dd>
+          </dl>
+        ) : (
+          <p className="muted">等待读取环境信息。</p>
+        )}
+      </div>
+
+      <div className="info-panel">
+        <h2>LOL 状态</h2>
+        {environment && environment.lolProcesses.length > 0 ? (
+          <ul className="plain-list">
+            {environment.lolProcesses.map((process) => (
+              <li key={`${process.pid}-${process.name}`}>
+                <span>{process.name}</span>
+                <small>pid {process.pid}</small>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="muted">暂未发现 League / Riot 相关进程。</p>
+        )}
+        <p className="metric-line">疑似 LOL 窗口：{lolTargets.length}</p>
+      </div>
+
+      <div className="info-panel">
+        <h2>可见目标</h2>
+        <p className="metric-line">已枚举 {targets.length} 个显示器/窗口。</p>
+        <div className="target-scroll">
+          {targets.slice(0, 12).map((item) => (
+            <div key={`${item.kind}-${item.id}-${item.label}`} className="target-row">
+              <span>{item.label}</span>
+              <small>
+                {item.kind}
+                {item.bounds ? ` · ${item.bounds.width}x${item.bounds.height}` : ""}
+              </small>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function ReportView({ report }: { report: DiagnosticReport }) {
+  return (
+    <section className="report-panel">
+      <div className="report-header">
+        <div>
+          <h2>诊断结果</h2>
+          <p>{report.summary}</p>
+        </div>
+        <span className="report-id">{report.id}</span>
+      </div>
+
+      <div className="attempt-list">
+        {report.attempts.map((attempt) => (
+          <article key={attempt.strategy} className="attempt-item">
+            <header>
+              <strong>{attempt.strategy}</strong>
+              <span className={attempt.status === "success" ? "badge success" : "badge failed"}>
+                {attempt.status === "success" ? "成功" : "失败"}
+              </span>
+            </header>
+            <dl>
+              <dt>目标</dt>
+              <dd>{attempt.targetLabel}</dd>
+              <dt>耗时</dt>
+              <dd>{attempt.durationMs}ms</dd>
+              <dt>尺寸</dt>
+              <dd>
+                {attempt.width && attempt.height ? `${attempt.width} × ${attempt.height}` : "-"}
+              </dd>
+              <dt>黑屏判断</dt>
+              <dd>{attempt.blackScreenSuspected == null ? "-" : attempt.blackScreenSuspected ? "疑似黑屏" : "未疑似黑屏"}</dd>
+              <dt>样本</dt>
+              <dd>{attempt.savedPath ?? "-"}</dd>
+            </dl>
+            {attempt.metrics ? (
+              <div className="metrics">
+                <span>平均亮度 {attempt.metrics.averageLuma.toFixed(2)}</span>
+                <span>方差 {attempt.metrics.lumaVariance.toFixed(2)}</span>
+                <span>近黑像素 {(attempt.metrics.nearBlackRatio * 100).toFixed(2)}%</span>
+              </div>
+            ) : null}
+            {attempt.error ? <p className="attempt-error">{attempt.error}</p> : null}
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function EmptyState() {
+  return (
+    <section className="empty-state">
+      <h2>等待诊断</h2>
+      <p>运行前请把 LOL 切到你要测试的显示模式。全屏测试优先选择“主显示器”。</p>
+    </section>
+  );
+}
+
+createRoot(document.getElementById("root") as HTMLElement).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>,
+);

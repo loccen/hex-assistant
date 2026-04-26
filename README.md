@@ -1,0 +1,74 @@
+# LOL 海克斯乱斗助手截图诊断 Demo
+
+这是第一阶段 Demo，只验证 LOL 全屏、无边框、窗口模式下的截图可行性。当前版本不做 OCR、不查询 ApexLOL、不显示局内覆盖层。
+
+## 运行环境
+
+- 项目运行时由 `mise.toml` 固定：
+  - Node.js `22.15.1`
+  - Rust `stable`
+- WSL 可以用于开发和前端构建。
+- 真实截图诊断必须在 Windows 桌面环境运行，因为 WSL 进程不能直接捕获 Windows 上的 LOL 画面。
+
+## 安装依赖
+
+```bash
+mise trust
+mise install
+mise exec -- npm install
+```
+
+## 开发运行
+
+在 Windows 桌面环境进入项目目录后执行：
+
+```bash
+mise exec -- npm run tauri dev
+```
+
+如果 Windows 侧没有 `mise`，也可以先用对应版本的 Node.js 和 Rust 运行：
+
+```bash
+npm install
+npm run tauri dev
+```
+
+## 首轮测试流程
+
+请分别测试以下场景：
+
+1. LOL 登录/客户端界面
+2. 游戏内窗口模式
+3. 游戏内无边框模式
+4. 游戏内全屏模式
+
+每个场景按下面步骤操作：
+
+1. 把 LOL 切到要测试的显示模式。
+2. 打开诊断 Demo。
+3. 优先选择“主显示器”并点击“运行截图诊断”。
+4. 如果 LOL 不是主显示器，改选“当前前台窗口”，把 LOL 切到最前面后再运行一次。
+5. 如果窗口标题能被识别，再选择“LOL 窗口”运行一次。
+6. 记录页面显示的结论。
+7. 打开页面中的导出目录，检查 `diagnostic.log`、`diagnostic.json` 和 PNG 样本。
+
+## 反馈内容
+
+每个场景至少反馈：
+
+- LOL 显示模式：窗口 / 无边框 / 全屏
+- 页面结论
+- 哪个策略成功
+- 是否疑似黑屏
+- `diagnostic.log`
+- 对应 PNG 样本
+
+日志里会包含系统版本、Rust target、应用数据目录、LOL/Riot 相关进程、可见窗口/显示器、截图尺寸、耗时、亮度统计、黑屏判断、样本路径和错误信息。
+
+## 当前诊断策略
+
+- `xcap_requested_target`：按页面选择的目标截图。
+- `xcap_primary_monitor`：始终截主显示器，用于验证全屏画面。
+- `xcap_center_region`：截主显示器中心区域，用于快速判断画面是否真实可见或全黑。
+
+如果全屏模式下三个策略都黑屏，第二阶段默认提示切换无边框，并保留手动输入兜底。
