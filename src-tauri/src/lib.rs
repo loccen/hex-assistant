@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     thread,
@@ -14,6 +15,9 @@ const OVERLAY_POC_LABEL: &str = "overlay-poc";
 const OVERLAY_POC_URL: &str = "index.html?view=overlay";
 const LIVE_CLIENT_ACTIVE_PLAYER_URL: &str = "https://127.0.0.1:2999/liveclientdata/activeplayer";
 const LIVE_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
+const APEX_LOL_BASE_URL: &str = "https://apexlol.info";
+const APEX_LOL_REQUEST_TIMEOUT: Duration = Duration::from_millis(6000);
+const APEX_LOL_CACHE_VERSION: u32 = 1;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -241,6 +245,39 @@ pub struct LiveClientApiStatus {
     pub checked_at: DateTime<Utc>,
     pub duration_ms: u128,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexLolAugmentRequest {
+    pub champion_name: String,
+    pub augment_name: String,
+    #[serde(default)]
+    pub force_refresh: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexLolAugmentResult {
+    pub champion_name: String,
+    pub augment_name: String,
+    pub rating: String,
+    pub summary: String,
+    pub tip: String,
+    pub source: String,
+    pub source_url: String,
+    pub fetched_at: DateTime<Utc>,
+    pub cache_hit: bool,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ApexLolCacheFile {
+    pub version: u32,
+    #[serde(default)]
+    pub entries: BTreeMap<String, ApexLolAugmentResult>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -528,6 +565,56 @@ async fn check_live_client_api() -> Result<LiveClientApiStatus, String> {
     Ok(result)
 }
 
+#[tauri::command]
+async fn resolve_apex_lol_augment(
+    app: AppHandle,
+    request: ApexLolAugmentRequest,
+) -> Result<ApexLolAugmentResult, String> {
+    let champion_name = request.champion_name.trim().to_string();
+    let augment_name = request.augment_name.trim().to_string();
+    let force_refresh = request.force_refresh.unwrap_or(false);
+    let cache_key = apex_lol_cache_key(&champion_name, &augment_name);
+    let cache_path = apex_lol_cache_path(&app)?;
+
+    if champion_name.is_empty() || augment_name.is_empty() {
+        return Ok(apex_lol_result(
+            champion_name,
+            augment_name,
+            apex_lol_search_url("", ""),
+            Utc::now(),
+            false,
+            "failed",
+            "暂无数据",
+            "",
+            "",
+            Some("championName 和 augmentName 不能为空。".to_string()),
+        ));
+    }
+
+    if !force_refresh {
+        if let Some(mut cached) = read_apex_lol_cache(&cache_path)
+            .ok()
+            .and_then(|cache| cache.entries.get(&cache_key).cloned())
+        {
+            cached.cache_hit = true;
+            return Ok(cached);
+        }
+    }
+
+    let mut result = fetch_apex_lol_augment(&champion_name, &augment_name).await;
+
+    if result.status != "failed" {
+        if let Err(err) = write_apex_lol_cache_entry(&cache_path, cache_key, &result) {
+            result.error = Some(match result.error.take() {
+                Some(error) => format!("{}；写入 ApexLOL 缓存失败: {}", error, err),
+                None => format!("写入 ApexLOL 缓存失败: {}", err),
+            });
+        }
+    }
+
+    Ok(result)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -541,7 +628,8 @@ pub fn run() {
             close_overlay_poc,
             set_overlay_poc_click_through,
             get_live_client_active_player,
-            check_live_client_api
+            check_live_client_api,
+            resolve_apex_lol_augment
         ])
         .run(tauri::generate_context!())
         .expect("启动屏幕截图诊断工具失败");
@@ -599,6 +687,604 @@ fn live_client_error(err: reqwest::Error) -> String {
     }
 
     format!("读取 Live Client Data API 失败: {}", message)
+}
+
+async fn fetch_apex_lol_augment(champion_name: &str, augment_name: &str) -> ApexLolAugmentResult {
+    let fetched_at = Utc::now();
+    let fallback_url = apex_lol_search_url(champion_name, augment_name);
+    let client = match reqwest::Client::builder()
+        .timeout(APEX_LOL_REQUEST_TIMEOUT)
+        .user_agent("hex-assistant/0.1 ApexLOL lookup")
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => {
+            return apex_lol_result(
+                champion_name.to_string(),
+                augment_name.to_string(),
+                fallback_url,
+                fetched_at,
+                false,
+                "failed",
+                "暂无数据",
+                "",
+                "",
+                Some(format!("创建 ApexLOL HTTP 客户端失败: {}", err)),
+            );
+        }
+    };
+
+    let mut last_error = None;
+    let mut no_data_result = None;
+    for locale in ["zh", "en"] {
+        match fetch_apex_lol_locale(&client, locale, champion_name, augment_name, fetched_at).await
+        {
+            Ok(Some(result)) if result.status == "ok" => return result,
+            Ok(Some(result)) => no_data_result = Some(result),
+            Ok(None) => {}
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    if let Some(result) = no_data_result {
+        return result;
+    }
+
+    apex_lol_result(
+        champion_name.to_string(),
+        augment_name.to_string(),
+        fallback_url,
+        fetched_at,
+        false,
+        if last_error.is_some() {
+            "failed"
+        } else {
+            "no_data"
+        },
+        "暂无数据",
+        "",
+        "",
+        Some(last_error.unwrap_or_else(|| {
+            "未能在 ApexLOL 的英雄页或海克斯页中找到该英雄与海克斯的联动记录。".to_string()
+        })),
+    )
+}
+
+async fn fetch_apex_lol_locale(
+    client: &reqwest::Client,
+    locale: &str,
+    champion_name: &str,
+    augment_name: &str,
+    fetched_at: DateTime<Utc>,
+) -> Result<Option<ApexLolAugmentResult>, String> {
+    let champion_index_url = format!("{}/{}/champions/", APEX_LOL_BASE_URL, locale);
+    let champion_index_html = fetch_apex_lol_html(client, &champion_index_url).await?;
+    let champion_url = resolve_apex_lol_link(
+        &champion_index_html,
+        champion_name,
+        &format!("/{}/champions/", locale),
+    );
+
+    if let Some(champion_url_value) = champion_url.as_deref() {
+        let champion_html = fetch_apex_lol_html(client, champion_url_value).await?;
+        if let Some(parsed) = parse_apex_lol_champion_page(
+            &champion_html,
+            champion_name,
+            augment_name,
+            champion_url_value,
+            fetched_at,
+        ) {
+            return Ok(Some(parsed));
+        }
+    }
+
+    let hextech_index_url = format!("{}/{}/hextech/", APEX_LOL_BASE_URL, locale);
+    let hextech_index_html = fetch_apex_lol_html(client, &hextech_index_url).await?;
+    let hextech_url = resolve_apex_lol_link(
+        &hextech_index_html,
+        augment_name,
+        &format!("/{}/hextech/", locale),
+    );
+
+    if let Some(hextech_url_value) = hextech_url.as_deref() {
+        let hextech_html = fetch_apex_lol_html(client, hextech_url_value).await?;
+        if let Some(parsed) = parse_apex_lol_hextech_page(
+            &hextech_html,
+            champion_name,
+            augment_name,
+            hextech_url_value,
+            fetched_at,
+        ) {
+            return Ok(Some(parsed));
+        }
+    }
+
+    let source_url = champion_url
+        .or(hextech_url)
+        .unwrap_or_else(|| apex_lol_search_url(champion_name, augment_name));
+
+    let summary = extract_meta_description(&champion_index_html)
+        .unwrap_or_else(|| "ApexLOL 暂无可解析的联动摘要。".to_string());
+
+    Ok(Some(apex_lol_result(
+        champion_name.to_string(),
+        augment_name.to_string(),
+        source_url,
+        fetched_at,
+        false,
+        "no_data",
+        "暂无数据",
+        &summary,
+        "",
+        Some("ApexLOL 页面可访问，但未定位到该英雄与海克斯的联动记录。".to_string()),
+    )))
+}
+
+async fn fetch_apex_lol_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(apex_lol_request_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("ApexLOL 返回 HTTP {}: {}", status, url));
+    }
+    response
+        .text()
+        .await
+        .map_err(|err| format!("读取 ApexLOL 响应失败: {}", err))
+}
+
+fn parse_apex_lol_champion_page(
+    html: &str,
+    champion_name: &str,
+    augment_name: &str,
+    source_url: &str,
+    fetched_at: DateTime<Utc>,
+) -> Option<ApexLolAugmentResult> {
+    let lines = apex_lol_lines_after_marker(html, &["海克斯联动分析", "Hextech Synergy Analysis"])
+        .unwrap_or_else(|| html_to_text_lines(html));
+    let index = find_line_index(&lines, augment_name)?;
+    let (rating, summary, tip) = parse_apex_lol_entry(&lines, index + 1);
+    let status = if rating.is_empty() && tip.is_empty() {
+        "no_data"
+    } else {
+        "ok"
+    };
+
+    Some(apex_lol_result(
+        champion_name.to_string(),
+        augment_name.to_string(),
+        source_url.to_string(),
+        fetched_at,
+        false,
+        status,
+        if rating.is_empty() {
+            "暂无数据"
+        } else {
+            rating.as_str()
+        },
+        summary.as_str(),
+        tip.as_str(),
+        if status == "no_data" {
+            Some("已找到海克斯名称，但未能稳定解析评分或说明。".to_string())
+        } else {
+            None
+        },
+    ))
+}
+
+fn parse_apex_lol_hextech_page(
+    html: &str,
+    champion_name: &str,
+    augment_name: &str,
+    source_url: &str,
+    fetched_at: DateTime<Utc>,
+) -> Option<ApexLolAugmentResult> {
+    let lines = apex_lol_lines_after_marker(
+        html,
+        &["关联英雄及联动分析", "Related Champions & Interactions"],
+    )
+    .unwrap_or_else(|| html_to_text_lines(html));
+    let index = find_line_index(&lines, champion_name)?;
+    let (rating, summary, tip) = parse_apex_lol_entry(&lines, index + 1);
+    let status = if rating.is_empty() && tip.is_empty() {
+        "no_data"
+    } else {
+        "ok"
+    };
+    let augment_summary = extract_apex_lol_description(html).unwrap_or(summary);
+
+    Some(apex_lol_result(
+        champion_name.to_string(),
+        augment_name.to_string(),
+        source_url.to_string(),
+        fetched_at,
+        false,
+        status,
+        if rating.is_empty() {
+            "暂无数据"
+        } else {
+            rating.as_str()
+        },
+        augment_summary.as_str(),
+        tip.as_str(),
+        if status == "no_data" {
+            Some("已找到英雄名称，但未能稳定解析评分或说明。".to_string())
+        } else {
+            None
+        },
+    ))
+}
+
+fn parse_apex_lol_entry(lines: &[String], start_index: usize) -> (String, String, String) {
+    let mut rating = String::new();
+    let mut summary = String::new();
+    let mut tip = String::new();
+    let end = (start_index + 18).min(lines.len());
+
+    for line in &lines[start_index..end] {
+        if rating.is_empty() {
+            if let Some((parsed_rating, parsed_summary)) = parse_apex_lol_rating(line) {
+                rating = parsed_rating;
+                summary = parsed_summary;
+                continue;
+            }
+        }
+
+        if tip.is_empty() && is_apex_lol_tip_line(line) {
+            tip = line.clone();
+        }
+    }
+
+    (rating, summary, tip)
+}
+
+fn parse_apex_lol_rating(line: &str) -> Option<(String, String)> {
+    let normalized = normalize_apex_lol_name(line);
+    for rating in ["SSS", "SS", "S", "A", "B", "C", "D"] {
+        if normalized == rating {
+            return Some((rating.to_string(), String::new()));
+        }
+
+        if let Some(rest) = normalized.strip_prefix(rating) {
+            if rest.starts_with("级") || rest.starts_with("TIER") {
+                let summary = line
+                    .replace(rating, "")
+                    .replace('级', "")
+                    .trim()
+                    .to_string();
+                return Some((rating.to_string(), summary));
+            }
+        }
+    }
+
+    None
+}
+
+fn is_apex_lol_tip_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.len() < 4 || trimmed.len() > 240 {
+        return false;
+    }
+
+    let normalized = normalize_apex_lol_name(trimmed);
+    if normalized.is_empty()
+        || normalized.chars().all(|value| value.is_ascii_digit())
+        || parse_apex_lol_rating(trimmed).is_some()
+    {
+        return false;
+    }
+
+    let blocked = [
+        "白银阶",
+        "黄金阶",
+        "棱彩阶",
+        "Silver",
+        "Gold",
+        "Prismatic",
+        "Image",
+        "Assist Me",
+        "Enemy Missing",
+        "作者:",
+        "Version:",
+        "版本:",
+        "推荐出装",
+        "Search Keywords",
+        "Last updated:",
+        "Pager",
+        "投稿",
+    ];
+    !blocked.iter().any(|prefix| trimmed.starts_with(prefix)) && !looks_like_apex_lol_date(trimmed)
+}
+
+fn looks_like_apex_lol_date(line: &str) -> bool {
+    let slash_count = line.chars().filter(|value| *value == '/').count();
+    slash_count >= 2 || line == "昨天" || line == "Today" || line == "Yesterday"
+}
+
+fn apex_lol_lines_after_marker(html: &str, markers: &[&str]) -> Option<Vec<String>> {
+    let lines = html_to_text_lines(html);
+    let start = lines
+        .iter()
+        .position(|line| markers.iter().any(|marker| line.contains(marker)))?;
+    Some(lines[start + 1..].to_vec())
+}
+
+fn find_line_index(lines: &[String], name: &str) -> Option<usize> {
+    let target = normalize_apex_lol_name(name);
+    if target.is_empty() {
+        return None;
+    }
+
+    lines.iter().position(|line| {
+        let line_name = normalize_apex_lol_name(line);
+        line_name == target || line_name.contains(&target)
+    })
+}
+
+fn resolve_apex_lol_link(html: &str, name: &str, required_prefix: &str) -> Option<String> {
+    let target = normalize_apex_lol_name(name);
+    if target.is_empty() {
+        return None;
+    }
+
+    extract_apex_lol_links(html)
+        .into_iter()
+        .find(|(href, text)| {
+            href.starts_with(required_prefix) && {
+                let href_name = href
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .map(normalize_apex_lol_name)
+                    .unwrap_or_default();
+                let text_name = normalize_apex_lol_name(text);
+                href_name == target
+                    || text_name == target
+                    || text_name.contains(&target)
+                    || target.contains(&text_name)
+            }
+        })
+        .map(|(href, _)| apex_lol_absolute_url(&href))
+}
+
+fn extract_apex_lol_links(html: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut remaining = html;
+    while let Some(start) = remaining.find("<a") {
+        remaining = &remaining[start..];
+        let Some(open_end) = remaining.find('>') else {
+            break;
+        };
+        let attrs = &remaining[..open_end];
+        let after_open = &remaining[open_end + 1..];
+        let Some(close_start) = after_open.find("</a>") else {
+            break;
+        };
+        if let Some(href) = extract_html_attr(attrs, "href") {
+            let text = html_to_text_lines(&after_open[..close_start]).join(" ");
+            links.push((html_unescape(&href), text));
+        }
+        remaining = &after_open[close_start + "</a>".len()..];
+    }
+    links
+}
+
+fn extract_html_attr(attrs: &str, name: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{}={}", name, quote);
+        if let Some(start) = attrs.find(&needle) {
+            let value_start = start + needle.len();
+            let value_rest = &attrs[value_start..];
+            let value_end = value_rest.find(quote)?;
+            return Some(value_rest[..value_end].to_string());
+        }
+    }
+    None
+}
+
+fn extract_meta_description(html: &str) -> Option<String> {
+    extract_meta_content(html, "description")
+}
+
+fn extract_meta_content(html: &str, name: &str) -> Option<String> {
+    let mut remaining = html;
+    let name_needle = format!("name=\"{}\"", name);
+    while let Some(start) = remaining.find("<meta") {
+        remaining = &remaining[start..];
+        let Some(end) = remaining.find('>') else {
+            break;
+        };
+        let tag = &remaining[..end];
+        if tag.contains(&name_needle) {
+            return extract_html_attr(tag, "content").map(|value| html_unescape(&value));
+        }
+        remaining = &remaining[end + 1..];
+    }
+    None
+}
+
+fn extract_apex_lol_description(html: &str) -> Option<String> {
+    let lines = apex_lol_lines_after_marker(html, &["效果描述", "Description"])?;
+    lines.into_iter().find(|line| is_apex_lol_tip_line(line))
+}
+
+fn html_to_text_lines(html: &str) -> Vec<String> {
+    let mut text = String::with_capacity(html.len().min(8192));
+    let mut in_tag = false;
+    let mut tag = String::new();
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                tag.clear();
+            }
+            '>' => {
+                let tag_name = tag
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if matches!(
+                    tag_name,
+                    "br" | "p"
+                        | "div"
+                        | "section"
+                        | "article"
+                        | "li"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "tr"
+                        | "td"
+                        | "th"
+                ) {
+                    text.push('\n');
+                } else {
+                    text.push(' ');
+                }
+                in_tag = false;
+            }
+            _ if in_tag => tag.push(ch),
+            _ => text.push(ch),
+        }
+    }
+
+    html_unescape(&text)
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|line| !line.is_empty())
+        .collect()
+}
+
+fn html_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&nbsp;", " ")
+}
+
+fn normalize_apex_lol_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_alphanumeric() || ('\u{4e00}'..='\u{9fff}').contains(ch))
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+fn apex_lol_absolute_url(href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        href.to_string()
+    } else if href.starts_with('/') {
+        format!("{}{}", APEX_LOL_BASE_URL, href)
+    } else {
+        format!("{}/{}", APEX_LOL_BASE_URL, href)
+    }
+}
+
+fn apex_lol_search_url(champion_name: &str, augment_name: &str) -> String {
+    match reqwest::Url::parse(APEX_LOL_BASE_URL) {
+        Ok(mut url) => {
+            url.set_path("/zh/");
+            url.query_pairs_mut()
+                .append_pair("q", &format!("{} {}", champion_name, augment_name));
+            url.to_string()
+        }
+        Err(_) => APEX_LOL_BASE_URL.to_string(),
+    }
+}
+
+fn apex_lol_request_error(err: reqwest::Error) -> String {
+    if err.is_timeout() {
+        return "ApexLOL 请求超时，请稍后重试或使用缓存结果。".to_string();
+    }
+    if err.is_connect() {
+        return "无法连接 ApexLOL，请检查网络后重试。".to_string();
+    }
+    format!("请求 ApexLOL 失败: {}", err)
+}
+
+fn apex_lol_result(
+    champion_name: String,
+    augment_name: String,
+    source_url: String,
+    fetched_at: DateTime<Utc>,
+    cache_hit: bool,
+    status: &str,
+    rating: &str,
+    summary: &str,
+    tip: &str,
+    error: Option<String>,
+) -> ApexLolAugmentResult {
+    ApexLolAugmentResult {
+        champion_name,
+        augment_name,
+        rating: rating.to_string(),
+        summary: summary.to_string(),
+        tip: tip.to_string(),
+        source: "ApexLOL".to_string(),
+        source_url,
+        fetched_at,
+        cache_hit,
+        status: status.to_string(),
+        error,
+    }
+}
+
+fn apex_lol_cache_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("apex-cache").join("cache.json"))
+}
+
+fn apex_lol_cache_key(champion_name: &str, augment_name: &str) -> String {
+    format!(
+        "{}::{}",
+        normalize_apex_lol_name(champion_name),
+        normalize_apex_lol_name(augment_name)
+    )
+}
+
+fn read_apex_lol_cache(path: &Path) -> Result<ApexLolCacheFile, String> {
+    if !path.exists() {
+        return Ok(ApexLolCacheFile {
+            version: APEX_LOL_CACHE_VERSION,
+            entries: BTreeMap::new(),
+        });
+    }
+
+    let content = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut cache: ApexLolCacheFile =
+        serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    if cache.version != APEX_LOL_CACHE_VERSION {
+        cache.version = APEX_LOL_CACHE_VERSION;
+    }
+    Ok(cache)
+}
+
+fn write_apex_lol_cache_entry(
+    path: &Path,
+    key: String,
+    result: &ApexLolAugmentResult,
+) -> Result<(), String> {
+    let mut cache = read_apex_lol_cache(path).unwrap_or_else(|_| ApexLolCacheFile {
+        version: APEX_LOL_CACHE_VERSION,
+        entries: BTreeMap::new(),
+    });
+    let mut cached = result.clone();
+    cached.cache_hit = false;
+    cache.entries.insert(key, cached);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let content = serde_json::to_string_pretty(&cache).map_err(|err| err.to_string())?;
+    fs::write(path, content).map_err(|err| err.to_string())
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
