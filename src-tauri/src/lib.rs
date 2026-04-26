@@ -2,18 +2,18 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
-use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const OVERLAY_POC_LABEL: &str = "overlay-poc";
 const OVERLAY_POC_URL: &str = "index.html?view=overlay";
+const LIVE_CLIENT_ACTIVE_PLAYER_URL: &str = "https://127.0.0.1:2999/liveclientdata/activeplayer";
+const LIVE_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +220,27 @@ pub struct OverlayPocClickThroughResult {
     pub applied: bool,
     pub supported: bool,
     pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveClientActivePlayerResult {
+    pub available: bool,
+    pub champion_name: Option<String>,
+    pub level: Option<u64>,
+    pub raw_json: Option<serde_json::Value>,
+    pub checked_at: DateTime<Utc>,
+    pub duration_ms: u128,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveClientApiStatus {
+    pub available: bool,
+    pub checked_at: DateTime<Utc>,
+    pub duration_ms: u128,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -452,6 +473,61 @@ fn set_overlay_poc_click_through(
     Ok(set_overlay_click_through(&window, enabled))
 }
 
+#[tauri::command]
+async fn get_live_client_active_player() -> Result<LiveClientActivePlayerResult, String> {
+    let checked_at = Utc::now();
+    let start = Instant::now();
+
+    let result = match fetch_live_client_active_player().await {
+        Ok(raw_json) => LiveClientActivePlayerResult {
+            available: true,
+            champion_name: raw_json
+                .get("championName")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            level: raw_json.get("level").and_then(serde_json::Value::as_u64),
+            raw_json: Some(raw_json),
+            checked_at,
+            duration_ms: start.elapsed().as_millis(),
+            error: None,
+        },
+        Err(error) => LiveClientActivePlayerResult {
+            available: false,
+            champion_name: None,
+            level: None,
+            raw_json: None,
+            checked_at,
+            duration_ms: start.elapsed().as_millis(),
+            error: Some(error),
+        },
+    };
+
+    Ok(result)
+}
+
+#[tauri::command]
+async fn check_live_client_api() -> Result<LiveClientApiStatus, String> {
+    let checked_at = Utc::now();
+    let start = Instant::now();
+
+    let result = match fetch_live_client_active_player().await {
+        Ok(_) => LiveClientApiStatus {
+            available: true,
+            checked_at,
+            duration_ms: start.elapsed().as_millis(),
+            error: None,
+        },
+        Err(error) => LiveClientApiStatus {
+            available: false,
+            checked_at,
+            duration_ms: start.elapsed().as_millis(),
+            error: Some(error),
+        },
+    };
+
+    Ok(result)
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -463,10 +539,66 @@ pub fn run() {
             load_calibration_profile,
             open_overlay_poc,
             close_overlay_poc,
-            set_overlay_poc_click_through
+            set_overlay_poc_click_through,
+            get_live_client_active_player,
+            check_live_client_api
         ])
         .run(tauri::generate_context!())
         .expect("启动屏幕截图诊断工具失败");
+}
+
+async fn fetch_live_client_active_player() -> Result<serde_json::Value, String> {
+    let url = live_client_active_player_url()?;
+    let client = reqwest::Client::builder()
+        .timeout(LIVE_CLIENT_REQUEST_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|err| format!("创建 Live Client Data API 客户端失败: {}", err))?;
+
+    let response = client.get(url).send().await.map_err(live_client_error)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!(
+            "Live Client Data API 返回 HTTP {}，请确认 LOL 对局已进入游戏。",
+            status
+        ));
+    }
+
+    let body = response.text().await.map_err(live_client_error)?;
+    serde_json::from_str(&body)
+        .map_err(|err| format!("解析 Live Client Data API 响应失败: {}", err))
+}
+
+fn live_client_active_player_url() -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(LIVE_CLIENT_ACTIVE_PLAYER_URL)
+        .map_err(|err| format!("Live Client Data API 地址配置无效: {}", err))?;
+    let is_local_active_player = url.scheme() == "https"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port_or_known_default() == Some(2999)
+        && url.path() == "/liveclientdata/activeplayer";
+
+    if is_local_active_player {
+        Ok(url)
+    } else {
+        Err("Live Client Data API 地址必须限定为 https://127.0.0.1:2999/liveclientdata/activeplayer。".to_string())
+    }
+}
+
+fn live_client_error(err: reqwest::Error) -> String {
+    if err.is_timeout() {
+        return "Live Client Data API 请求超时，请确认 LOL 正在运行且已进入游戏。".to_string();
+    }
+
+    if err.is_connect() {
+        return "无法连接 Live Client Data API，请确认 LOL 正在运行且已进入游戏。".to_string();
+    }
+
+    let message = err.to_string();
+    if message.to_ascii_lowercase().contains("cert") {
+        return format!("Live Client Data API 本地 HTTPS 证书处理失败: {}", message);
+    }
+
+    format!("读取 Live Client Data API 失败: {}", message)
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
