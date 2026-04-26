@@ -744,6 +744,89 @@ dd {
   font-weight: 400;
 }
 
+.ocr-candidate-list,
+.ocr-debug-panel {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ocr-candidate-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) 52px;
+  gap: 8px;
+  align-items: center;
+  padding: 6px 8px;
+  color: #475049;
+  background: #f7f8f4;
+  border: 1px solid #e4e8df;
+  border-radius: 7px;
+  font-size: 12px;
+}
+
+.ocr-candidate-row span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.ocr-debug-image-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.ocr-debug-image-grid figure {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+}
+
+.ocr-debug-image-grid img,
+.ocr-debug-image-empty {
+  width: 100%;
+  aspect-ratio: 3 / 1;
+  object-fit: contain;
+  background: #20242b;
+  border: 1px solid #dfe3db;
+  border-radius: 6px;
+}
+
+.ocr-debug-image-empty {
+  display: grid;
+  place-items: center;
+  color: #ffffff;
+  font-size: 12px;
+}
+
+.ocr-debug-image-grid figcaption {
+  color: #69707a;
+  font-size: 12px;
+}
+
+.debug-path,
+.debug-path-list {
+  min-width: 0;
+  margin: 0;
+  color: #69707a;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.debug-path-list {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr);
+  gap: 4px 8px;
+}
+
+.debug-path-list dt {
+  color: #475049;
+  font-weight: 700;
+}
+
+.debug-path-list dd {
+  margin: 0;
+}
+
 .apex-result-card {
   display: grid;
   gap: 12px;

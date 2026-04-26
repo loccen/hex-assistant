@@ -228,6 +228,16 @@ type DragSelection = {
 };
 
 type OcrSlotStatus = "pending" | "recognized" | "suspect" | "manual" | "failed";
+type OcrDebugImageKind = "raw" | "focused" | "enhanced";
+
+type OcrCandidateResult = {
+  sourceKind: OcrDebugImageKind;
+  rawText: string;
+  confidence: number;
+  matchScore: number;
+  matchedName: string;
+  status: OcrSlotStatus;
+};
 
 type OcrSlotResult = {
   slot: number;
@@ -237,6 +247,19 @@ type OcrSlotResult = {
   matchScore: number;
   status: OcrSlotStatus;
   message?: string;
+  sourceKind?: OcrDebugImageKind;
+  candidates?: OcrCandidateResult[];
+  debugImages?: Partial<Record<OcrDebugImageKind, string>>;
+  debugPaths?: Partial<Record<OcrDebugImageKind, string>>;
+  debugDirectory?: string;
+};
+
+type OcrDebugImagesResult = {
+  directory: string;
+  files: Array<{
+    kind: string;
+    path: string;
+  }>;
 };
 
 type LiveClientActivePlayerResult = {
@@ -355,6 +378,9 @@ const HEX_NAME_LIBRARY = [
   "诅咒冠冕",
   "黄金门票",
   "快速思考",
+  "最万用的瞄准镜",
+  "小猫咪找妈妈",
+  "回归基本功",
 ];
 
 function App() {
@@ -1309,12 +1335,71 @@ function App() {
       });
 
       const nextResults: OcrSlotResult[] = [];
+      const debugRunId = `ocr-${new Date().toISOString().replace(/[:.]/g, "-")}`;
       const nameRegions = calibrationProfile.nameRegions.slice().sort((left, right) => left.slot - right.slot);
       for (const region of nameRegions) {
         setOcrProgress(`识别 slot ${region.slot}...`);
-        const cropCanvas = cropRegionToCanvas(image, region);
-        const result = await worker.recognize(cropCanvas);
-        nextResults.push(buildOcrResult(region.slot, result.data.text, result.data.confidence));
+        const debugCanvases = buildOcrDebugCanvases(image, region);
+        const debugImages = Object.fromEntries(
+          debugCanvases.map((item) => [item.kind, item.canvas.toDataURL("image/png")]),
+        ) as Record<OcrDebugImageKind, string>;
+
+        const candidates: OcrCandidateResult[] = [
+          await recognizeOcrCandidate(worker, "enhanced", debugCanvases.find((item) => item.kind === "enhanced")!.canvas),
+        ];
+        const enhancedCandidate = candidates[0];
+        if (
+          enhancedCandidate.confidence < OCR_CONFIDENCE_THRESHOLD ||
+          enhancedCandidate.matchScore < OCR_MATCH_THRESHOLD
+        ) {
+          const fallbackKinds: OcrDebugImageKind[] = ["focused", "raw"];
+          for (const kind of fallbackKinds) {
+            const canvas = debugCanvases.find((item) => item.kind === kind)?.canvas;
+            if (canvas) {
+              candidates.push(await recognizeOcrCandidate(worker, kind, canvas));
+            }
+          }
+        }
+
+        let debugDirectory: string | undefined;
+        let debugPaths: Partial<Record<OcrDebugImageKind, string>> = {};
+        try {
+          const saveResult = await invoke<OcrDebugImagesResult>("save_ocr_debug_images", {
+            request: {
+              samplePath: calibrationSnapshot.samplePath ?? null,
+              runId: debugRunId,
+              slot: region.slot,
+              images: (Object.keys(debugImages) as OcrDebugImageKind[]).map((kind) => ({
+                kind,
+                dataUrl: debugImages[kind],
+              })),
+            },
+          });
+          debugDirectory = saveResult.directory;
+          debugPaths = Object.fromEntries(
+            saveResult.files.map((file) => [file.kind, file.path]),
+          ) as Partial<Record<OcrDebugImageKind, string>>;
+        } catch (err) {
+          void appendTestEvent({
+            stage: "ocr",
+            action: "saveDebugImages",
+            message: `slot ${region.slot} OCR 调试图保存失败。`,
+            details: {
+              slot: region.slot,
+              error: summarizeError(err),
+            },
+          });
+        }
+
+        const bestResult = selectBestOcrResult(region.slot, candidates);
+        nextResults.push({
+          ...bestResult,
+          sourceKind: bestResult.sourceKind,
+          candidates,
+          debugImages,
+          debugPaths,
+          debugDirectory,
+        });
       }
 
       const changedSlots = nextResults
@@ -1341,6 +1426,17 @@ function App() {
             matchedName: result.matchedName,
             matchScore: result.matchScore,
             status: result.status,
+            sourceKind: result.sourceKind,
+            debugDirectory: result.debugDirectory ?? null,
+            debugPaths: result.debugPaths ?? {},
+            candidates: result.candidates?.map((candidate) => ({
+              sourceKind: candidate.sourceKind,
+              rawText: candidate.rawText,
+              confidence: candidate.confidence,
+              matchedName: candidate.matchedName,
+              matchScore: candidate.matchScore,
+              status: candidate.status,
+            })),
           })),
         },
       });
@@ -2328,7 +2424,51 @@ function OcrWorkspace({
                 <dd>{formatScore(result.matchScore * 100)}</dd>
                 <dt>状态</dt>
                 <dd>{result.message ?? formatOcrStatus(result.status)}</dd>
+                <dt>最终来源</dt>
+                <dd>{result.sourceKind ? formatOcrDebugKind(result.sourceKind) : "未记录"}</dd>
               </dl>
+              {result.candidates?.length ? (
+                <div className="ocr-candidate-list">
+                  <strong>候选 OCR</strong>
+                  {result.candidates.map((candidate) => (
+                    <div key={candidate.sourceKind} className="ocr-candidate-row">
+                      <span>{formatOcrDebugKind(candidate.sourceKind)}</span>
+                      <span>{candidate.rawText || "未识别到文本"}</span>
+                      <span>{formatScore(candidate.confidence)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+              {result.debugImages ? (
+                <div className="ocr-debug-panel">
+                  <strong>定位调试图</strong>
+                  <div className="ocr-debug-image-grid">
+                    {(["raw", "focused", "enhanced"] as OcrDebugImageKind[]).map((kind) => (
+                      <figure key={kind}>
+                        {result.debugImages?.[kind] ? (
+                          <img src={result.debugImages[kind]} alt={`slot ${result.slot} ${formatOcrDebugKind(kind)}`} />
+                        ) : (
+                          <div className="ocr-debug-image-empty">无图片</div>
+                        )}
+                        <figcaption>{formatOcrDebugKind(kind)}</figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                  {result.debugDirectory ? <p className="debug-path">{result.debugDirectory}</p> : null}
+                  {result.debugPaths ? (
+                    <dl className="debug-path-list">
+                      {(["raw", "focused", "enhanced"] as OcrDebugImageKind[]).map((kind) =>
+                        result.debugPaths?.[kind] ? (
+                          <React.Fragment key={kind}>
+                            <dt>{formatOcrDebugKind(kind)}</dt>
+                            <dd>{result.debugPaths[kind]}</dd>
+                          </React.Fragment>
+                        ) : null,
+                      )}
+                    </dl>
+                  ) : null}
+                </div>
+              ) : null}
               {changedSlots.includes(result.slot) ? (
                 <p className="slot-refresh-note">只刷新对应 slot</p>
               ) : null}
@@ -3226,21 +3366,83 @@ function OverlayPocPage() {
 function buildOcrResult(slot: number, rawText: string, confidence: number): OcrSlotResult {
   const cleanRawText = rawText.replace(/\s+/g, " ").trim();
   const match = matchHexName(cleanRawText);
+  const normalizedConfidence = Math.max(0, confidence || 0);
   const status =
-    confidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
+    normalizedConfidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
 
   return {
     slot,
     rawText: cleanRawText,
-    confidence: Math.max(0, confidence || 0),
-    matchedName: match.name,
+    confidence: normalizedConfidence,
+    matchedName: status === "recognized" ? match.name : "",
     matchScore: match.score,
     status,
     message:
       status === "suspect"
-        ? "疑似结果，需要人工确认或修正"
+        ? "疑似结果，需要查看定位调试图或人工修正"
         : "已通过词库匹配",
   };
+}
+
+function buildOcrCandidate(sourceKind: OcrDebugImageKind, rawText: string, confidence: number): OcrCandidateResult {
+  const result = buildOcrResult(0, rawText, confidence);
+  return {
+    sourceKind,
+    rawText: result.rawText,
+    confidence: result.confidence,
+    matchedName: result.matchedName,
+    matchScore: result.matchScore,
+    status: result.status,
+  };
+}
+
+async function recognizeOcrCandidate(
+  worker: Tesseract.Worker,
+  sourceKind: OcrDebugImageKind,
+  canvas: HTMLCanvasElement,
+) {
+  const result = await worker.recognize(canvas);
+  return buildOcrCandidate(sourceKind, result.data.text, result.data.confidence);
+}
+
+function selectBestOcrResult(slot: number, candidates: OcrCandidateResult[]): OcrSlotResult {
+  const best = candidates.slice().sort((left, right) => {
+    const leftRecognized = left.status === "recognized" ? 1 : 0;
+    const rightRecognized = right.status === "recognized" ? 1 : 0;
+    if (leftRecognized !== rightRecognized) {
+      return rightRecognized - leftRecognized;
+    }
+    const leftScore = left.matchScore * 0.6 + (left.confidence / 100) * 0.4;
+    const rightScore = right.matchScore * 0.6 + (right.confidence / 100) * 0.4;
+    if (leftScore !== rightScore) {
+      return rightScore - leftScore;
+    }
+    return ocrSourcePriority(right.sourceKind) - ocrSourcePriority(left.sourceKind);
+  })[0];
+
+  return {
+    slot,
+    rawText: best?.rawText ?? "",
+    confidence: best?.confidence ?? 0,
+    matchedName: best?.matchedName ?? "",
+    matchScore: best?.matchScore ?? 0,
+    status: best?.status ?? "failed",
+    sourceKind: best?.sourceKind,
+    message:
+      best?.status === "recognized"
+        ? `已通过词库匹配，来源：${formatOcrDebugKind(best.sourceKind)}`
+        : "疑似结果，需要查看定位调试图或人工修正",
+  };
+}
+
+function ocrSourcePriority(sourceKind: OcrDebugImageKind) {
+  if (sourceKind === "enhanced") {
+    return 3;
+  }
+  if (sourceKind === "focused") {
+    return 2;
+  }
+  return 1;
 }
 
 function matchHexName(rawText: string) {
@@ -3315,14 +3517,32 @@ function loadImageElement(src: string) {
   });
 }
 
-function cropRegionToCanvas(image: HTMLImageElement, region: SlottedRatioRegion) {
+function buildOcrDebugCanvases(image: HTMLImageElement, region: SlottedRatioRegion) {
+  const rawCanvas = cropRegionToCanvas(image, region, { yOffsetRatio: 0, heightRatio: 1, scale: 1 });
+  const focusedCanvas = cropRegionToCanvas(image, region, { yOffsetRatio: 0.04, heightRatio: 0.62, scale: 1 });
+  const enhancedCanvas = enhanceOcrCanvas(focusedCanvas, 4);
+
+  return [
+    { kind: "raw" as const, canvas: rawCanvas },
+    { kind: "focused" as const, canvas: focusedCanvas },
+    { kind: "enhanced" as const, canvas: enhancedCanvas },
+  ];
+}
+
+function cropRegionToCanvas(
+  image: HTMLImageElement,
+  region: SlottedRatioRegion,
+  options: { yOffsetRatio: number; heightRatio: number; scale: number },
+) {
   const naturalWidth = image.naturalWidth || image.width;
   const naturalHeight = image.naturalHeight || image.height;
   const sourceX = Math.round(region.xRatio * naturalWidth);
-  const sourceY = Math.round(region.yRatio * naturalHeight);
+  const fullSourceY = region.yRatio * naturalHeight;
+  const fullSourceHeight = Math.max(1, Math.round(region.heightRatio * naturalHeight));
+  const sourceY = Math.round(fullSourceY + fullSourceHeight * options.yOffsetRatio);
   const sourceWidth = Math.max(1, Math.round(region.widthRatio * naturalWidth));
-  const sourceHeight = Math.max(1, Math.round(region.heightRatio * naturalHeight));
-  const scale = sourceWidth < 260 ? 2 : 1;
+  const sourceHeight = Math.max(1, Math.round(fullSourceHeight * options.heightRatio));
+  const scale = Math.max(1, options.scale);
   const canvas = document.createElement("canvas");
   canvas.width = sourceWidth * scale;
   canvas.height = sourceHeight * scale;
@@ -3333,6 +3553,32 @@ function cropRegionToCanvas(image: HTMLImageElement, region: SlottedRatioRegion)
 
   context.imageSmoothingEnabled = false;
   context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
+function enhanceOcrCanvas(source: HTMLCanvasElement, scale: number) {
+  const canvas = document.createElement("canvas");
+  canvas.width = source.width * scale;
+  canvas.height = source.height * scale;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("当前环境无法创建 OCR 增强画布。");
+  }
+
+  context.imageSmoothingEnabled = false;
+  context.drawImage(source, 0, 0, canvas.width, canvas.height);
+
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    const luma = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+    const contrasted = clampNumber((luma - 96) * 1.85 + 128, 0, 255);
+    const value = contrasted >= 150 ? 255 : 0;
+    data[index] = value;
+    data[index + 1] = value;
+    data[index + 2] = value;
+  }
+  context.putImageData(imageData, 0, 0);
   return canvas;
 }
 
@@ -3457,6 +3703,16 @@ function formatOcrStatus(status: OcrSlotStatus) {
     return "等待";
   }
   return "疑似结果";
+}
+
+function formatOcrDebugKind(kind: OcrDebugImageKind) {
+  if (kind === "raw") {
+    return "原始裁剪";
+  }
+  if (kind === "focused") {
+    return "名称行裁剪";
+  }
+  return "增强裁剪";
 }
 
 function formatStateMachineStatus(status: StateMachineStatus) {
@@ -3700,6 +3956,10 @@ function defaultOverlayCards(width: number, height: number): OverlayPocCardInfo[
 
 function clamp(value: number) {
   return Math.max(0, Math.min(1, value));
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
 }
 
 function roundRatio(value: number) {

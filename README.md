@@ -20,7 +20,7 @@
 - 截图诊断：支持目标显示器截图、主显示器截图、中心区域截图，导出日志、JSON 和 PNG 样本，用于判断截图是否成功、是否黑屏。
 - 校准与区域保存：支持保存截图尺寸、归一化坐标、名称 OCR 区域、底部锚点区域、展示 / 隐藏按钮区域，并可重新加载。
 - Overlay POC：支持按校准锚点渲染三张说明卡片，用于验证位置、显示和隐藏逻辑。
-- OCR POC：支持对校准后的名称区域做 OCR，并结合词库纠错得到标准海克斯名称。
+- OCR POC：支持对校准后的名称区域做 OCR，并结合词库纠错得到标准海克斯名称；运行时会保存 slot 原始裁剪图、名称行裁剪图和增强裁剪图，方便判断定位是否偏移。
 - Live Client API 与状态机 POC：支持通过本地允许接口读取状态信息，并用状态机区分普通监听、等级满足、面板收起、面板展开、当前轮处理等状态。
 - ApexLOL 后端查询 / 缓存接口：支持按英雄和海克斯查询后端接口并写入缓存，前端查询展示 POC 已实现；真实来源解析稳定性、Overlay 局内展示和真实样本验收仍待完成。
 
@@ -112,6 +112,16 @@ mise exec -- npm run build
 4. 在真实 Windows 桌面环境中测试点击穿透，不要只看开发窗口效果。
 5. 对真实游戏样本运行 OCR，记录原始识别结果、置信度和词库纠错结果。
 6. 悬停符文让详情浮层遮挡底部按钮区域时，确认三张卡片仍展开、Overlay 不隐藏、OCR 不停止。
+
+已有无边框截图样本时，可以不重新进游戏，直接离线复盘 OCR 定位：
+
+```bash
+mise exec -- node scripts/replay-ocr-debug.mjs \
+  /mnt/c/Users/loccen/AppData/Roaming/dev.local.screen-capture-diagnostic/calibration/profile.json \
+  /mnt/c/Users/loccen/AppData/Roaming/dev.local.screen-capture-diagnostic/calibration/snapshots/calibration-20260426-182847-monitor-0.png
+```
+
+脚本会在 `ocr-debug-replay/` 下生成三槽 raw、focused、enhanced PNG 和 `replay-report.json`；如果离线 OCR 环境不可用，也会保留裁剪坐标和图片路径，便于人工查看定位。
 
 ## 反馈内容
 

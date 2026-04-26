@@ -114,6 +114,39 @@ pub struct CalibrationSnapshotDataUrl {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+pub struct OcrDebugImageInput {
+    pub kind: String,
+    pub data_url: String,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrDebugImagesRequest {
+    #[serde(default)]
+    pub sample_path: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    pub slot: u8,
+    #[serde(default)]
+    pub images: Vec<OcrDebugImageInput>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrDebugImagePath {
+    pub kind: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OcrDebugImagesResult {
+    pub directory: String,
+    pub files: Vec<OcrDebugImagePath>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct RatioRegion {
     pub x_ratio: f64,
     pub y_ratio: f64,
@@ -513,6 +546,52 @@ fn read_calibration_snapshot_data_url(
 }
 
 #[tauri::command]
+fn save_ocr_debug_images(
+    app: AppHandle,
+    request: OcrDebugImagesRequest,
+) -> Result<OcrDebugImagesResult, String> {
+    if !(1..=3).contains(&request.slot) {
+        return Err("OCR 调试图 slot 必须是 1、2 或 3。".to_string());
+    }
+    if request.images.is_empty() {
+        return Err("OCR 调试图不能为空。".to_string());
+    }
+    if request.images.len() > 12 {
+        return Err("单次最多保存 12 张 OCR 调试图。".to_string());
+    }
+
+    if let Some(sample_path) = request.sample_path.as_deref() {
+        validate_optional_calibration_sample_path(&app, sample_path)?;
+    }
+
+    let run_id = request
+        .run_id
+        .as_deref()
+        .map(sanitize_ocr_debug_segment)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Utc::now().format("%Y%m%d-%H%M%S%.3f").to_string());
+    let debug_dir = app_data_dir(&app)?.join("ocr-debug").join(run_id);
+    fs::create_dir_all(&debug_dir).map_err(|err| err.to_string())?;
+
+    let mut files = Vec::new();
+    for image in request.images {
+        let kind = sanitize_ocr_debug_kind(&image.kind);
+        let bytes = decode_png_data_url(&image.data_url)?;
+        let file_path = debug_dir.join(format!("slot-{}-{}.png", request.slot, kind));
+        fs::write(&file_path, bytes).map_err(|err| err.to_string())?;
+        files.push(OcrDebugImagePath {
+            kind,
+            path: file_path.display().to_string(),
+        });
+    }
+
+    Ok(OcrDebugImagesResult {
+        directory: debug_dir.display().to_string(),
+        files,
+    })
+}
+
+#[tauri::command]
 fn save_calibration_profile(app: AppHandle, profile: CalibrationProfile) -> Result<(), String> {
     validate_calibration_profile(&profile)?;
 
@@ -748,6 +827,7 @@ pub fn run() {
             run_capture_diagnostic,
             capture_calibration_snapshot,
             read_calibration_snapshot_data_url,
+            save_ocr_debug_images,
             save_calibration_profile,
             load_calibration_profile,
             open_overlay_poc,
@@ -1508,6 +1588,73 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn calibration_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("calibration").join("profile.json"))
+}
+
+fn validate_optional_calibration_sample_path(
+    app: &AppHandle,
+    sample_path: &str,
+) -> Result<(), String> {
+    let snapshots_dir = app_data_dir(app)?.join("calibration").join("snapshots");
+    let snapshots_dir = snapshots_dir
+        .canonicalize()
+        .map_err(|_| "校准截图目录不存在。".to_string())?;
+    let sample_path = PathBuf::from(sample_path);
+    let sample_path = sample_path
+        .canonicalize()
+        .map_err(|_| "校准截图样本不存在。".to_string())?;
+
+    if !sample_path.starts_with(&snapshots_dir) {
+        return Err("OCR 调试图只能关联应用数据目录中的校准截图样本。".to_string());
+    }
+
+    let is_png = sample_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return Err("OCR 调试图只能关联 PNG 格式的校准截图样本。".to_string());
+    }
+    Ok(())
+}
+
+fn decode_png_data_url(data_url: &str) -> Result<Vec<u8>, String> {
+    const PNG_DATA_URL_PREFIX: &str = "data:image/png;base64,";
+    let encoded = data_url
+        .strip_prefix(PNG_DATA_URL_PREFIX)
+        .ok_or_else(|| "OCR 调试图只接受 data:image/png;base64 格式。".to_string())?;
+    general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|err| format!("OCR 调试图 base64 解码失败: {}", err))
+}
+
+fn sanitize_ocr_debug_kind(kind: &str) -> String {
+    match kind.trim() {
+        "raw" => "raw".to_string(),
+        "focused" => "focused".to_string(),
+        "enhanced" => "enhanced".to_string(),
+        value => {
+            let cleaned = sanitize_ocr_debug_segment(value);
+            if cleaned.is_empty() {
+                "image".to_string()
+            } else {
+                cleaned
+            }
+        }
+    }
+}
+
+fn sanitize_ocr_debug_segment(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' || character == '_' {
+                Some(character)
+            } else {
+                None
+            }
+        })
+        .take(48)
+        .collect()
 }
 
 fn read_calibration_profile(app: &AppHandle) -> Result<Option<CalibrationProfile>, String> {

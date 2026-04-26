@@ -4,6 +4,7 @@ src-tauri/target/
 src-tauri/gen/
 src-tauri/.tauri/
 artifacts/
+ocr-debug-replay/
 .DS_Store
 *.log
 *.tmp
