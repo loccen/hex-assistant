@@ -2951,10 +2951,10 @@ function CalibrationWorkspace({
               />
             ) : (
               <div className="preview-placeholder">
-                <strong>{snapshot ? "无法直接预览本地样本" : "等待校准截图"}</strong>
+                <strong>{snapshot ? "截图数据加载失败" : "等待校准截图"}</strong>
                 <span>
                   {snapshot
-                    ? "当前环境未能通过本地文件协议显示截图，仍可按截图尺寸使用占位预览框选。"
+                    ? "请重新获取校准截图后再框选。"
                     : "获取截图后会按返回尺寸显示预览区域。"}
                 </span>
               </div>
