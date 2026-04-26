@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createRoot } from "react-dom/client";
 import Tesseract from "tesseract.js";
@@ -164,7 +164,7 @@ type OverlayStoredState = {
   cards: OverlayPocCardInfo[];
 };
 
-type Mode = "diagnostic" | "calibration" | "overlay" | "ocr";
+type Mode = "diagnostic" | "calibration" | "overlay" | "ocr" | "stateMachine";
 type RegionKey =
   | "name-1"
   | "name-2"
@@ -204,6 +204,36 @@ type OcrSlotResult = {
   message?: string;
 };
 
+type LiveClientActivePlayerResult = {
+  available: boolean;
+  championName?: string | null;
+  level?: number | null;
+  rawJson?: unknown;
+  checkedAt: string;
+  durationMs: number;
+  error?: string | null;
+};
+
+type StateMachineStatus =
+  | "IN_GAME_MONITORING"
+  | "AUGMENT_ELIGIBLE"
+  | "AUGMENT_STAGE_ACTIVE"
+  | "AUGMENT_COLLAPSED"
+  | "AUGMENT_EXPANDED"
+  | "AUGMENT_ROUND_COMPLETED"
+  | "AUGMENT_STAGE_COMPLETED";
+
+type VisualDetectionInput = {
+  buttonVisible: boolean;
+  cardsExpanded: boolean;
+};
+
+type StateMachineEvent = {
+  id: number;
+  time: string;
+  message: string;
+};
+
 const REGION_DEFINITIONS: RegionDefinition[] = [
   { key: "name-1", label: "名称 slot1", summary: "第一张名称 OCR 区域", group: "name", slot: 1 },
   { key: "name-2", label: "名称 slot2", summary: "第二张名称 OCR 区域", group: "name", slot: 2 },
@@ -236,6 +266,16 @@ const OCR_MATCH_THRESHOLD = 0.72;
 const OCR_WORKER_PATH = "/ocr-assets/tesseract/worker.min.js";
 const OCR_CORE_PATH = "/ocr-assets/tesseract-core";
 const OCR_LANG_PATH = "/ocr-assets/lang";
+const AUGMENT_MILESTONES = [3, 7, 11, 15];
+const STATE_MACHINE_STATUSES: StateMachineStatus[] = [
+  "IN_GAME_MONITORING",
+  "AUGMENT_ELIGIBLE",
+  "AUGMENT_STAGE_ACTIVE",
+  "AUGMENT_COLLAPSED",
+  "AUGMENT_EXPANDED",
+  "AUGMENT_ROUND_COMPLETED",
+  "AUGMENT_STAGE_COMPLETED",
+];
 const HEX_NAME_LIBRARY = [
   "吞噬灵魂",
   "巨像勇气",
@@ -297,6 +337,19 @@ function App() {
   const [ocrMessage, setOcrMessage] = useState<string | null>(null);
   const [ocrProgress, setOcrProgress] = useState<string | null>(null);
   const [ocrChangedSlots, setOcrChangedSlots] = useState<number[]>([]);
+  const [liveClientPlayer, setLiveClientPlayer] = useState<LiveClientActivePlayerResult | null>(null);
+  const [liveClientLoading, setLiveClientLoading] = useState(false);
+  const [completedMilestones, setCompletedMilestones] = useState<number[]>([]);
+  const [visualInput, setVisualInput] = useState<VisualDetectionInput>({
+    buttonVisible: false,
+    cardsExpanded: false,
+  });
+  const [stateMachineSlots, setStateMachineSlots] = useState<string[]>(["", "", ""]);
+  const [stateMachineChangedSlots, setStateMachineChangedSlots] = useState<number[]>([]);
+  const [stateMachineEvents, setStateMachineEvents] = useState<StateMachineEvent[]>([]);
+  const stateMachineEventIdRef = useRef(1);
+  const previousStateRef = useRef<StateMachineStatus | null>(null);
+  const previousQueueSignatureRef = useRef<string | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -312,6 +365,30 @@ function App() {
     [monitorTargets, selectedMonitorId],
   );
   const canRunOcr = Boolean(calibrationProfile && calibrationSnapshot?.samplePath);
+  const pendingMilestoneQueue = useMemo(
+    () => buildPendingMilestoneQueue(liveClientPlayer, completedMilestones),
+    [completedMilestones, liveClientPlayer],
+  );
+  const stateMachineStatus = useMemo(
+    () => deriveStateMachineStatus(liveClientPlayer, pendingMilestoneQueue, completedMilestones, visualInput),
+    [completedMilestones, liveClientPlayer, pendingMilestoneQueue, visualInput],
+  );
+
+  const queueSignature = pendingMilestoneQueue.join(",");
+
+  useEffect(() => {
+    if (previousStateRef.current && previousStateRef.current !== stateMachineStatus) {
+      addStateMachineEvent(`状态变化：${formatStateMachineStatus(previousStateRef.current)} -> ${formatStateMachineStatus(stateMachineStatus)}`);
+    }
+    previousStateRef.current = stateMachineStatus;
+  }, [stateMachineStatus]);
+
+  useEffect(() => {
+    if (previousQueueSignatureRef.current !== null && previousQueueSignatureRef.current !== queueSignature) {
+      addStateMachineEvent(`队列变化：${formatMilestoneQueue(pendingMilestoneQueue)}`);
+    }
+    previousQueueSignatureRef.current = queueSignature;
+  }, [pendingMilestoneQueue, queueSignature]);
 
   async function refresh() {
     setError(null);
@@ -365,6 +442,116 @@ function App() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function addStateMachineEvent(message: string) {
+    const event: StateMachineEvent = {
+      id: stateMachineEventIdRef.current,
+      time: new Date().toLocaleTimeString("zh-CN", { hour12: false }),
+      message,
+    };
+    stateMachineEventIdRef.current += 1;
+    setStateMachineEvents((current) => [event, ...current].slice(0, 80));
+  }
+
+  async function refreshLiveClientActivePlayer() {
+    setLiveClientLoading(true);
+    try {
+      const result = await invoke<LiveClientActivePlayerResult>("get_live_client_active_player");
+      setLiveClientPlayer(result);
+      addStateMachineEvent(
+        result.available
+          ? `刷新本地接口：${result.championName ?? "未知英雄"}，等级 ${result.level ?? "-"}，耗时 ${result.durationMs}ms`
+          : `刷新本地接口：不可用，耗时 ${result.durationMs}ms，错误：${result.error ?? "无"}`,
+      );
+    } catch (err) {
+      const message = String(err);
+      setLiveClientPlayer({
+        available: false,
+        championName: null,
+        level: null,
+        checkedAt: new Date().toISOString(),
+        durationMs: 0,
+        error: message,
+      });
+      addStateMachineEvent(`刷新本地接口失败：${message}`);
+    } finally {
+      setLiveClientLoading(false);
+    }
+  }
+
+  function updateVisualInput(patch: Partial<VisualDetectionInput>) {
+    const next = { ...visualInput, ...patch };
+    const changes: string[] = [];
+    if (next.buttonVisible !== visualInput.buttonVisible) {
+      changes.push(`按钮${next.buttonVisible ? "存在" : "不存在"}`);
+    }
+    if (next.cardsExpanded !== visualInput.cardsExpanded) {
+      changes.push(`卡片${next.cardsExpanded ? "展开" : "收起"}`);
+    }
+    setVisualInput(next);
+    if (changes.length > 0) {
+      addStateMachineEvent(`人工视觉输入：${changes.join("，")}`);
+    }
+  }
+
+  function updateStateMachineSlot(slot: number, value: string) {
+    const next = [...stateMachineSlots];
+    const previous = next[slot - 1] ?? "";
+    const normalizedValue = value.trim();
+    next[slot - 1] = normalizedValue;
+    setStateMachineSlots(next);
+    if (previous !== normalizedValue) {
+      setStateMachineChangedSlots((current) =>
+        current.includes(slot) ? current : [...current, slot].sort((left, right) => left - right),
+      );
+      addStateMachineEvent(`slot ${slot} 名称变化：${previous || "空"} -> ${normalizedValue || "空"}`);
+    }
+  }
+
+  function applyOcrResultsToStateMachine() {
+    const sortedResults = ocrResults.slice().sort((left, right) => left.slot - right.slot);
+    if (sortedResults.length === 0) {
+      addStateMachineEvent("读取 OCR 结果：当前没有 Stage 2C 结果，请手动输入三 slot 名称。");
+      return;
+    }
+
+    const nextSlots = [1, 2, 3].map((slot) => sortedResults.find((result) => result.slot === slot)?.matchedName.trim() ?? "");
+    const changedSlots = nextSlots
+      .map((value, index) => ({ slot: index + 1, value, previous: stateMachineSlots[index] ?? "" }))
+      .filter((item) => item.value !== item.previous)
+      .map((item) => item.slot);
+
+    setStateMachineSlots(nextSlots);
+    if (changedSlots.length > 0) {
+      setStateMachineChangedSlots((current) =>
+        Array.from(new Set([...current, ...changedSlots])).sort((left, right) => left - right),
+      );
+      addStateMachineEvent(`读取 OCR 结果：slot ${changedSlots.join("、")} 名称变化，只标记变化 slot。`);
+    } else {
+      addStateMachineEvent("读取 OCR 结果：三 slot 名称未变化。");
+    }
+  }
+
+  function clearStateMachineChangedSlots() {
+    setStateMachineChangedSlots([]);
+    addStateMachineEvent("已清除 slot 变化标记，未重置当前阶段。");
+  }
+
+  function completeCurrentMilestone() {
+    const milestone = pendingMilestoneQueue[0];
+    if (!milestone) {
+      addStateMachineEvent("标记当前轮完成：当前没有待处理档位。");
+      return;
+    }
+    if (visualInput.buttonVisible) {
+      addStateMachineEvent("标记当前轮完成被拦截：按钮仍存在，卡片消失不等于完成。");
+      return;
+    }
+    setCompletedMilestones((current) =>
+      current.includes(milestone) ? current : [...current, milestone].sort((left, right) => left - right),
+    );
+    addStateMachineEvent(`已标记 ${milestone} 级海克斯轮完成。`);
   }
 
   async function captureCalibrationSnapshot() {
@@ -626,11 +813,18 @@ function App() {
             >
               OCR POC
             </button>
+            <button
+              className={mode === "stateMachine" ? "selected" : ""}
+              onClick={() => setMode("stateMachine")}
+              type="button"
+            >
+              状态机 POC
+            </button>
           </div>
           <button
             className="ghost-button"
             onClick={refresh}
-            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading || ocrLoading}
+            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading || ocrLoading || liveClientLoading}
             type="button"
           >
             刷新环境
@@ -667,6 +861,13 @@ function App() {
               hasCalibrationProfile={Boolean(calibrationProfile)}
               hasCalibrationSnapshot={Boolean(calibrationSnapshot?.samplePath)}
               onRun={runOcrPoc}
+            />
+          ) : mode === "stateMachine" ? (
+            <StateMachineControls
+              loading={liveClientLoading}
+              canComplete={Boolean(pendingMilestoneQueue[0]) && !visualInput.buttonVisible}
+              onRefresh={refreshLiveClientActivePlayer}
+              onComplete={completeCurrentMilestone}
             />
           ) : (
             <CalibrationControls
@@ -717,6 +918,25 @@ function App() {
               progress={ocrProgress}
               changedSlots={ocrChangedSlots}
               onManualCorrect={applyManualOcrCorrection}
+            />
+          ) : mode === "stateMachine" ? (
+            <StateMachineWorkspace
+              player={liveClientPlayer}
+              loading={liveClientLoading}
+              visualInput={visualInput}
+              slots={stateMachineSlots}
+              changedSlots={stateMachineChangedSlots}
+              completedMilestones={completedMilestones}
+              pendingMilestoneQueue={pendingMilestoneQueue}
+              status={stateMachineStatus}
+              ocrResults={ocrResults}
+              events={stateMachineEvents}
+              onRefresh={refreshLiveClientActivePlayer}
+              onVisualInputChange={updateVisualInput}
+              onSlotChange={updateStateMachineSlot}
+              onApplyOcrResults={applyOcrResultsToStateMachine}
+              onClearChangedSlots={clearStateMachineChangedSlots}
+              onCompleteCurrentMilestone={completeCurrentMilestone}
             />
           ) : (
             <CalibrationWorkspace
@@ -982,6 +1202,45 @@ function OcrControls({
       <div className="button-stack">
         <button className="primary-button" onClick={onRun} disabled={loading || !canRun} type="button">
           {loading ? "OCR 识别中..." : "运行三槽 OCR"}
+        </button>
+      </div>
+    </>
+  );
+}
+
+function StateMachineControls({
+  loading,
+  canComplete,
+  onRefresh,
+  onComplete,
+}: {
+  loading: boolean;
+  canComplete: boolean;
+  onRefresh: () => void;
+  onComplete: () => void;
+}) {
+  return (
+    <>
+      <h2>状态机 POC</h2>
+      <div className="target-option selected static-target">
+        <span>
+          <strong>本地只读 Live Client Data API</strong>
+          <small>
+            只读取本机 active-player 英雄和等级，视觉检测输入为人工开关；不做自动点击、自动选择或 ApexLOL 查询。
+          </small>
+        </span>
+      </div>
+
+      <div className="overlay-note">
+        默认不自动轮询。需要更新英雄、等级或接口状态时，请手动刷新本地接口。
+      </div>
+
+      <div className="button-stack">
+        <button className="primary-button" onClick={onRefresh} disabled={loading} type="button">
+          {loading ? "刷新中..." : "手动刷新本地接口"}
+        </button>
+        <button className="secondary-button" onClick={onComplete} disabled={loading || !canComplete} type="button">
+          标记当前轮完成
         </button>
       </div>
     </>
@@ -1291,6 +1550,234 @@ function OcrWorkspace({
           <option key={name} value={name} />
         ))}
       </datalist>
+    </section>
+  );
+}
+
+function StateMachineWorkspace({
+  player,
+  loading,
+  visualInput,
+  slots,
+  changedSlots,
+  completedMilestones,
+  pendingMilestoneQueue,
+  status,
+  ocrResults,
+  events,
+  onRefresh,
+  onVisualInputChange,
+  onSlotChange,
+  onApplyOcrResults,
+  onClearChangedSlots,
+  onCompleteCurrentMilestone,
+}: {
+  player: LiveClientActivePlayerResult | null;
+  loading: boolean;
+  visualInput: VisualDetectionInput;
+  slots: string[];
+  changedSlots: number[];
+  completedMilestones: number[];
+  pendingMilestoneQueue: number[];
+  status: StateMachineStatus;
+  ocrResults: OcrSlotResult[];
+  events: StateMachineEvent[];
+  onRefresh: () => void;
+  onVisualInputChange: (patch: Partial<VisualDetectionInput>) => void;
+  onSlotChange: (slot: number, value: string) => void;
+  onApplyOcrResults: () => void;
+  onClearChangedSlots: () => void;
+  onCompleteCurrentMilestone: () => void;
+}) {
+  const currentMilestone = pendingMilestoneQueue[0] ?? null;
+  const canCompleteCurrentRound = Boolean(currentMilestone) && !visualInput.buttonVisible;
+  const sortedOcrResults = ocrResults.slice().sort((left, right) => left.slot - right.slot);
+
+  return (
+    <section className="report-panel state-machine-workspace">
+      <div className="report-header">
+        <div>
+          <h2>Stage 2D 本地接口与状态机 POC</h2>
+          <p>
+            读取本机 Live Client Data API 的英雄和等级，结合人工视觉输入与 Stage 2C OCR 名称演示海克斯选择状态机。
+          </p>
+        </div>
+        <span className="report-id">Stage 2D</span>
+      </div>
+
+      <div className="overlay-note strong">
+        这是 POC。视觉检测输入是人工开关；本页不新增进程扫描、窗口标题识别、Hook、内存读取、自动点击、自动选择或 ApexLOL 查询。
+      </div>
+
+      <div className="state-machine-summary">
+        <div className="state-current-card">
+          <span>当前状态</span>
+          <strong>{status}</strong>
+          <p>{formatStateMachineStatus(status)}</p>
+        </div>
+
+        <div className="state-status-grid">
+          {STATE_MACHINE_STATUSES.map((item) => (
+            <span key={item} className={`state-pill ${item === status ? "active" : ""}`}>
+              {item}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className="state-machine-grid">
+        <section className="info-panel">
+          <div className="panel-title-row">
+            <h2>本地接口</h2>
+            <button className="ghost-button compact-button" onClick={onRefresh} disabled={loading} type="button">
+              {loading ? "刷新中..." : "刷新"}
+            </button>
+          </div>
+          {player ? (
+            <dl>
+              <dt>available</dt>
+              <dd>{formatBoolean(player.available)}</dd>
+              <dt>英雄</dt>
+              <dd>{player.championName ?? "-"}</dd>
+              <dt>等级</dt>
+              <dd>{player.level ?? "-"}</dd>
+              <dt>耗时</dt>
+              <dd>{player.durationMs}ms</dd>
+              <dt>检查时间</dt>
+              <dd>{formatDateTime(player.checkedAt)}</dd>
+              <dt>error</dt>
+              <dd>{player.error ?? "-"}</dd>
+            </dl>
+          ) : (
+            <p className="muted">尚未刷新本地接口。默认不自动轮询，请手动刷新。</p>
+          )}
+        </section>
+
+        <section className="info-panel">
+          <h2>档位队列</h2>
+          <dl>
+            <dt>档位</dt>
+            <dd>{AUGMENT_MILESTONES.join(" / ")}</dd>
+            <dt>已完成</dt>
+            <dd>{formatMilestoneQueue(completedMilestones)}</dd>
+            <dt>待处理</dt>
+            <dd>{formatMilestoneQueue(pendingMilestoneQueue)}</dd>
+            <dt>当前轮</dt>
+            <dd>{currentMilestone ? `${currentMilestone} 级` : "-"}</dd>
+          </dl>
+          <button
+            className="secondary-button inline-action"
+            onClick={onCompleteCurrentMilestone}
+            disabled={!canCompleteCurrentRound}
+            type="button"
+          >
+            标记当前轮完成
+          </button>
+          <p className="muted">
+            按钮仍存在时不能标记完成；卡片消失不等于完成，只有按钮消失才允许阶段结束。
+          </p>
+        </section>
+      </div>
+
+      <section className="state-machine-grid">
+        <div className="info-panel">
+          <h2>人工视觉检测输入</h2>
+          <div className="toggle-grid">
+            <button
+              className={`toggle-button ${visualInput.buttonVisible ? "active" : ""}`}
+              onClick={() => onVisualInputChange({ buttonVisible: true })}
+              type="button"
+            >
+              按钮存在
+            </button>
+            <button
+              className={`toggle-button ${!visualInput.buttonVisible ? "active" : ""}`}
+              onClick={() => onVisualInputChange({ buttonVisible: false })}
+              type="button"
+            >
+              按钮不存在
+            </button>
+            <button
+              className={`toggle-button ${!visualInput.cardsExpanded ? "active" : ""}`}
+              onClick={() => onVisualInputChange({ cardsExpanded: false })}
+              type="button"
+            >
+              卡片收起
+            </button>
+            <button
+              className={`toggle-button ${visualInput.cardsExpanded ? "active" : ""}`}
+              onClick={() => onVisualInputChange({ cardsExpanded: true })}
+              type="button"
+            >
+              卡片展开
+            </button>
+          </div>
+          <p className="muted">
+            按钮存在且卡片收起会提示隐藏 Overlay 且不标记完成；按钮存在且卡片展开时允许使用三 slot 名称。
+          </p>
+        </div>
+
+        <div className="info-panel">
+          <div className="panel-title-row">
+            <h2>三 slot 名称</h2>
+            <button className="ghost-button compact-button" onClick={onApplyOcrResults} type="button">
+              读取 OCR
+            </button>
+          </div>
+          {sortedOcrResults.length > 0 ? (
+            <p className="muted">可读取 Stage 2C 当前 OCR 结果；名称变化只标记变化 slot，不重置整个阶段。</p>
+          ) : (
+            <p className="muted">当前没有 Stage 2C OCR 结果，可直接手动输入三 slot 名称。</p>
+          )}
+          <div className="slot-input-grid">
+            {[1, 2, 3].map((slot) => (
+              <label key={slot} className={`slot-input ${changedSlots.includes(slot) ? "changed" : ""}`}>
+                <span>slot {slot}</span>
+                <input
+                  value={slots[slot - 1] ?? ""}
+                  onChange={(event) => onSlotChange(slot, event.currentTarget.value)}
+                  placeholder="手动输入海克斯名称"
+                />
+              </label>
+            ))}
+          </div>
+          {changedSlots.length > 0 ? (
+            <div className="slot-change-actions">
+              <span>变化 slot：{changedSlots.join("、")}</span>
+              <button className="ghost-button compact-button" onClick={onClearChangedSlots} type="button">
+                清除标记
+              </button>
+            </div>
+          ) : null}
+        </div>
+      </section>
+
+      <section className="info-panel">
+        <h2>状态机规则说明</h2>
+        <ul className="rule-list">
+          <li>接口 unavailable 或等级低于 3：保持普通监听。</li>
+          <li>有待处理档位且按钮不存在：进入可触发状态。</li>
+          <li>按钮存在且卡片收起：认为入口折叠，提示隐藏 Overlay，不标记完成。</li>
+          <li>按钮存在且卡片展开：进入展开状态，可使用三 slot 名称。</li>
+          <li>点击“标记当前轮完成”只移除队列首个档位；多档位会按 3、7、11、15 依次处理。</li>
+        </ul>
+      </section>
+
+      <section className="info-panel">
+        <h2>事件日志</h2>
+        {events.length > 0 ? (
+          <ol className="event-list">
+            {events.map((event) => (
+              <li key={event.id}>
+                <time>{event.time}</time>
+                <span>{event.message}</span>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          <p className="muted">暂无事件。刷新接口、状态变化、队列变化和 slot 变化都会记录。</p>
+        )}
+      </section>
     </section>
   );
 }
@@ -1837,6 +2324,40 @@ function allRegionsSelected(regions: RegionMap) {
   return REGION_DEFINITIONS.every((definition) => Boolean(regions[definition.key]));
 }
 
+function buildPendingMilestoneQueue(
+  player: LiveClientActivePlayerResult | null,
+  completedMilestones: number[],
+) {
+  if (!player?.available || !player.level) {
+    return [];
+  }
+  return AUGMENT_MILESTONES.filter(
+    (milestone) => player.level !== null && player.level !== undefined && milestone <= player.level,
+  ).filter((milestone) => !completedMilestones.includes(milestone));
+}
+
+function deriveStateMachineStatus(
+  player: LiveClientActivePlayerResult | null,
+  pendingMilestoneQueue: number[],
+  completedMilestones: number[],
+  visualInput: VisualDetectionInput,
+): StateMachineStatus {
+  if (!player?.available || !player.level || player.level < 3) {
+    return "IN_GAME_MONITORING";
+  }
+  if (pendingMilestoneQueue.length === 0) {
+    const allMilestonesCompleted = AUGMENT_MILESTONES.every((milestone) => completedMilestones.includes(milestone));
+    return allMilestonesCompleted ? "AUGMENT_STAGE_COMPLETED" : "AUGMENT_ROUND_COMPLETED";
+  }
+  if (!visualInput.buttonVisible) {
+    return "AUGMENT_ELIGIBLE";
+  }
+  if (visualInput.cardsExpanded) {
+    return "AUGMENT_EXPANDED";
+  }
+  return "AUGMENT_COLLAPSED";
+}
+
 function regionToStyle(region: RatioRegion): React.CSSProperties {
   return {
     left: `${region.xRatio * 100}%`,
@@ -1872,6 +2393,39 @@ function formatOcrStatus(status: OcrSlotStatus) {
     return "等待";
   }
   return "疑似结果";
+}
+
+function formatStateMachineStatus(status: StateMachineStatus) {
+  switch (status) {
+    case "IN_GAME_MONITORING":
+      return "普通监听：接口不可用、未进入游戏或等级低于 3。";
+    case "AUGMENT_ELIGIBLE":
+      return "有待处理档位，但按钮当前不存在，等待人工确认入口出现。";
+    case "AUGMENT_STAGE_ACTIVE":
+      return "海克斯阶段已激活。";
+    case "AUGMENT_COLLAPSED":
+      return "按钮存在且卡片收起：应隐藏 Overlay，不标记完成。";
+    case "AUGMENT_EXPANDED":
+      return "按钮存在且卡片展开：可以使用三 slot 名称。";
+    case "AUGMENT_ROUND_COMPLETED":
+      return "当前等级已触发的档位都已完成，继续监听后续等级。";
+    case "AUGMENT_STAGE_COMPLETED":
+      return "3、7、11、15 四个档位都已完成。";
+    default:
+      return status;
+  }
+}
+
+function formatMilestoneQueue(values: number[]) {
+  return values.length > 0 ? values.map((value) => `${value} 级`).join(" -> ") : "无";
+}
+
+function formatDateTime(value: string) {
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  return parsed.toLocaleString("zh-CN", { hour12: false });
 }
 
 function formatScore(value: number) {

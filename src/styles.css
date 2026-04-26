@@ -427,6 +427,11 @@ dd {
   gap: 16px;
 }
 
+.state-machine-workspace {
+  display: grid;
+  gap: 16px;
+}
+
 .overlay-result-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -454,6 +459,174 @@ dd {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+
+.state-machine-summary {
+  display: grid;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+  gap: 14px;
+}
+
+.state-current-card {
+  display: grid;
+  gap: 8px;
+  padding: 16px;
+  color: #ffffff;
+  background: #2f6f57;
+  border-radius: 8px;
+}
+
+.state-current-card span {
+  font-size: 13px;
+  opacity: 0.82;
+}
+
+.state-current-card strong {
+  overflow-wrap: anywhere;
+  font-size: 18px;
+}
+
+.state-current-card p {
+  color: rgba(255, 255, 255, 0.88);
+  line-height: 1.45;
+}
+
+.state-status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  align-content: start;
+}
+
+.state-pill {
+  min-width: 0;
+  padding: 8px 10px;
+  overflow-wrap: anywhere;
+  color: #586057;
+  background: #f5f6f2;
+  border: 1px solid #dfe3db;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.state-pill.active {
+  color: #176240;
+  background: #e5f4eb;
+  border-color: #98c5ac;
+}
+
+.state-machine-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.panel-title-row,
+.slot-change-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.compact-button {
+  min-height: 34px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
+.inline-action {
+  margin-top: 14px;
+}
+
+.toggle-grid,
+.slot-input-grid {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.toggle-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.toggle-button {
+  min-height: 40px;
+  padding: 0 12px;
+  color: #475049;
+  background: #ffffff;
+  border: 1px solid #cfd5cc;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.toggle-button.active {
+  color: #ffffff;
+  background: #2f6f57;
+  border-color: #2f6f57;
+}
+
+.slot-input {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  color: #475049;
+  background: #fbfcf9;
+  border: 1px solid #dfe3db;
+  border-radius: 8px;
+  font-weight: 700;
+}
+
+.slot-input.changed {
+  border-color: #c26b3f;
+  box-shadow: inset 4px 0 0 #c26b3f;
+}
+
+.slot-input input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #20242b;
+  background: #ffffff;
+  border: 1px solid #cfd5cc;
+  border-radius: 7px;
+  font-weight: 400;
+}
+
+.slot-change-actions {
+  margin-top: 12px;
+  color: #8a4b22;
+}
+
+.rule-list,
+.event-list {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding-left: 18px;
+}
+
+.rule-list li,
+.event-list li {
+  line-height: 1.45;
+}
+
+.event-list {
+  max-height: 280px;
+  overflow: auto;
+}
+
+.event-list li {
+  padding-bottom: 8px;
+  border-bottom: 1px solid #edf0e9;
+}
+
+.event-list time {
+  display: inline-block;
+  min-width: 72px;
+  color: #69707a;
+  font-variant-numeric: tabular-nums;
 }
 
 .ocr-result-card {
@@ -740,6 +913,9 @@ dd {
   .ocr-result-list,
   .overlay-card-list,
   .calibration-layout,
+  .state-machine-summary,
+  .state-status-grid,
+  .state-machine-grid,
   .profile-region-grid {
     grid-template-columns: 1fr;
   }
