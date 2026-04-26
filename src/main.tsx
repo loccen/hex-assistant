@@ -65,6 +65,23 @@ type DiagnosticReport = {
   jsonPath: string;
 };
 
+type TestEventInput = {
+  stage: string;
+  action: string;
+  message: string;
+  details?: Record<string, unknown>;
+};
+
+type TestEvent = TestEventInput & {
+  createdAt: string;
+};
+
+type TestLogPaths = {
+  dir: string;
+  jsonlPath: string;
+  mdPath: string;
+};
+
 type CalibrationMonitorInfo = {
   id: string;
   name: string;
@@ -336,6 +353,9 @@ function App() {
   const [report, setReport] = useState<DiagnosticReport | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [testLogPaths, setTestLogPaths] = useState<TestLogPaths | null>(null);
+  const [testLogMessage, setTestLogMessage] = useState<string | null>(null);
+  const [testLogLoading, setTestLogLoading] = useState(false);
   const [selectedMonitorId, setSelectedMonitorId] = useState("");
   const [calibrationSnapshot, setCalibrationSnapshot] = useState<CalibrationSnapshotResult | null>(
     null,
@@ -389,6 +409,7 @@ function App() {
   useEffect(() => {
     void refresh();
     void loadCalibrationProfile();
+    void refreshTestLogPaths();
   }, []);
 
   const monitorTargets = useMemo(
@@ -454,6 +475,42 @@ function App() {
     previousQueueSignatureRef.current = queueSignature;
   }, [pendingMilestoneQueue, queueSignature]);
 
+  async function refreshTestLogPaths() {
+    setTestLogLoading(true);
+    try {
+      const paths = await invoke<TestLogPaths>("get_test_log_paths");
+      setTestLogPaths(paths);
+      setTestLogMessage("已刷新测试日志路径。");
+    } catch (err) {
+      setTestLogMessage(`读取测试日志路径失败：${summarizeError(err)}`);
+    } finally {
+      setTestLogLoading(false);
+    }
+  }
+
+  async function resetTestLog() {
+    setTestLogLoading(true);
+    try {
+      await invoke<TestEvent>("reset_test_log");
+      const paths = await invoke<TestLogPaths>("get_test_log_paths");
+      setTestLogPaths(paths);
+      setTestLogMessage("已开始新的测试操作日志。");
+    } catch (err) {
+      setTestLogMessage(`开始新日志失败：${summarizeError(err)}`);
+    } finally {
+      setTestLogLoading(false);
+    }
+  }
+
+  async function appendTestEvent(event: TestEventInput) {
+    try {
+      await invoke<TestEvent>("append_test_event", { event });
+      setTestLogMessage(`${event.stage} / ${event.action} 已写入测试日志。`);
+    } catch (err) {
+      setTestLogMessage(`写入测试日志失败：${summarizeError(err)}`);
+    }
+  }
+
   async function refresh() {
     setError(null);
     try {
@@ -501,8 +558,32 @@ function App() {
       setReport(result);
       setEnvironment(result.environment);
       setTargets(result.targets);
+      void appendTestEvent({
+        stage: "diagnostic",
+        action: "runCaptureDiagnostic",
+        message: "截图诊断完成。",
+        details: {
+          reportDir: result.reportDir,
+          logPath: result.logPath,
+          jsonPath: result.jsonPath,
+          summary: result.summary,
+          attempts: result.attempts.map((attempt) => ({
+            strategy: attempt.strategy,
+            status: attempt.status,
+            savedPath: attempt.savedPath,
+            error: attempt.error ? summarizeError(attempt.error) : null,
+          })),
+        },
+      });
     } catch (err) {
-      setError(String(err));
+      const message = summarizeError(err);
+      setError(message);
+      void appendTestEvent({
+        stage: "diagnostic",
+        action: "runCaptureDiagnostic",
+        message: "截图诊断失败。",
+        details: { error: message, saveSamples, delaySeconds },
+      });
     } finally {
       setLoading(false);
     }
@@ -528,8 +609,14 @@ function App() {
           ? `刷新本地接口：${result.championName ?? "未知英雄"}，等级 ${result.level ?? "-"}，耗时 ${result.durationMs}ms`
           : `刷新本地接口：不可用，耗时 ${result.durationMs}ms，错误：${result.error ?? "无"}`,
       );
+      void appendTestEvent({
+        stage: "stateMachine",
+        action: "refreshLiveClient",
+        message: result.available ? "状态机刷新 Live Client 成功。" : "状态机刷新 Live Client 不可用。",
+        details: liveClientDetails(result),
+      });
     } catch (err) {
-      const message = String(err);
+      const message = summarizeError(err);
       setLiveClientPlayer({
         available: false,
         championName: null,
@@ -539,6 +626,12 @@ function App() {
         error: message,
       });
       addStateMachineEvent(`刷新本地接口失败：${message}`);
+      void appendTestEvent({
+        stage: "stateMachine",
+        action: "refreshLiveClient",
+        message: "状态机刷新 Live Client 失败。",
+        details: { error: message },
+      });
     } finally {
       setLiveClientLoading(false);
     }
@@ -556,8 +649,14 @@ function App() {
       } else {
         setApexMessage("未读取到当前英雄，可手动输入英雄名称。");
       }
+      void appendTestEvent({
+        stage: "apexLol",
+        action: "refreshLiveClient",
+        message: result.available ? "ApexLOL 刷新当前英雄成功。" : "ApexLOL 刷新当前英雄未读取到可用结果。",
+        details: liveClientDetails(result),
+      });
     } catch (err) {
-      const message = String(err);
+      const message = summarizeError(err);
       setLiveClientPlayer({
         available: false,
         championName: null,
@@ -568,6 +667,12 @@ function App() {
       });
       setApexMessage("未读取到当前英雄，可手动输入英雄名称。");
       setApexError(message);
+      void appendTestEvent({
+        stage: "apexLol",
+        action: "refreshLiveClient",
+        message: "ApexLOL 刷新当前英雄失败。",
+        details: { error: message },
+      });
     } finally {
       setLiveClientLoading(false);
     }
@@ -643,6 +748,17 @@ function App() {
     } else {
       setApexMessage(forceRefresh ? "已强制刷新三张结果。" : "已查询三张结果。");
     }
+    void appendTestEvent({
+      stage: "apexLol",
+      action: forceRefresh ? "forceRefreshAllSlots" : "queryAllSlots",
+      message: forceRefresh ? "ApexLOL 强制刷新三张操作完成。" : "ApexLOL 查询三张操作完成。",
+      details: {
+        championName,
+        requestedCount,
+        skippedCount,
+        slots: apexSlots.map((value, index) => ({ slot: index + 1, augmentName: value.trim() })),
+      },
+    });
   }
 
   async function queryApexSlot(slot: number, forceRefresh: boolean) {
@@ -652,6 +768,12 @@ function App() {
 
     if (!championName || !augmentName) {
       updateApexSlotResult(buildApexNoDataResult(slot, championName, augmentName, queryKey));
+      void appendTestEvent({
+        stage: "apexLol",
+        action: forceRefresh ? "forceRefreshSlot" : "querySlot",
+        message: "ApexLOL 单 slot 查询缺少必要输入。",
+        details: { slot, championName, augmentName, forceRefresh },
+      });
       return;
     }
 
@@ -670,14 +792,36 @@ function App() {
         slot,
         queryKey,
       });
+      void appendTestEvent({
+        stage: "apexLol",
+        action: forceRefresh ? "forceRefreshSlot" : "querySlot",
+        message: "ApexLOL 单 slot 查询完成。",
+        details: {
+          slot,
+          championName,
+          augmentName,
+          forceRefresh,
+          status: result.status,
+          rating: result.rating,
+          cacheHit: result.cacheHit,
+          sourceUrl: result.sourceUrl,
+          error: result.error ? summarizeError(result.error) : null,
+        },
+      });
     } catch (err) {
-      const message = String(err);
+      const message = summarizeError(err);
       updateApexSlotResult({
         ...buildApexNoDataResult(slot, championName, augmentName, queryKey),
         status: "failed",
         error: message,
       });
       setApexError(message);
+      void appendTestEvent({
+        stage: "apexLol",
+        action: forceRefresh ? "forceRefreshSlot" : "querySlot",
+        message: "ApexLOL 单 slot 查询失败。",
+        details: { slot, championName, augmentName, forceRefresh, error: message },
+      });
     } finally {
       setApexLoadingSlots((current) => current.filter((loadingSlot) => loadingSlot !== slot));
     }
@@ -704,6 +848,16 @@ function App() {
     setVisualInput(next);
     if (changes.length > 0) {
       addStateMachineEvent(`人工视觉输入：${changes.join("，")}`);
+      void appendTestEvent({
+        stage: "stateMachine",
+        action: "updateVisualInput",
+        message: `状态机人工视觉开关已更新：${changes.join("，")}。`,
+        details: {
+          buttonVisible: next.buttonVisible,
+          cardsExpanded: next.cardsExpanded,
+          status: deriveStateMachineStatus(liveClientPlayer, pendingMilestoneQueue, completedMilestones, next),
+        },
+      });
     }
   }
 
@@ -754,16 +908,50 @@ function App() {
     const milestone = pendingMilestoneQueue[0];
     if (!milestone) {
       addStateMachineEvent("标记当前轮完成：当前没有待处理档位。");
+      void appendTestEvent({
+        stage: "stateMachine",
+        action: "completeCurrentMilestone",
+        message: "标记当前轮完成未执行：当前没有待处理档位。",
+        details: {
+          completedMilestones,
+          pendingMilestoneQueue,
+          status: stateMachineStatus,
+        },
+      });
       return;
     }
     if (visualInput.buttonVisible) {
       addStateMachineEvent("标记当前轮完成被拦截：按钮仍存在，卡片消失不等于完成。");
+      void appendTestEvent({
+        stage: "stateMachine",
+        action: "completeCurrentMilestone",
+        message: "标记当前轮完成被拦截：按钮仍存在。",
+        details: {
+          milestone,
+          visualInput,
+          completedMilestones,
+          pendingMilestoneQueue,
+          status: stateMachineStatus,
+        },
+      });
       return;
     }
     setCompletedMilestones((current) =>
       current.includes(milestone) ? current : [...current, milestone].sort((left, right) => left - right),
     );
     addStateMachineEvent(`已标记 ${milestone} 级海克斯轮完成。`);
+    void appendTestEvent({
+      stage: "stateMachine",
+      action: "completeCurrentMilestone",
+      message: `已标记 ${milestone} 级海克斯轮完成。`,
+      details: {
+        milestone,
+        visualInput,
+        completedMilestones: [...completedMilestones, milestone].sort((left, right) => left - right),
+        pendingMilestoneQueue,
+        status: stateMachineStatus,
+      },
+    });
   }
 
   async function captureCalibrationSnapshot() {
@@ -781,8 +969,34 @@ function App() {
       setCalibrationSnapshot(result);
       setSelectedMonitorId(result.monitor.id);
       setCalibrationMessage("已获取校准截图，可以开始框选区域。");
+      void appendTestEvent({
+        stage: "calibration",
+        action: "captureSnapshot",
+        message: "校准截图完成。",
+        details: {
+          samplePath: result.samplePath,
+          width: result.width,
+          height: result.height,
+          monitor: result.monitor,
+          blackScreenSuspected: result.blackScreenSuspected,
+          metrics: result.metrics,
+          request,
+        },
+      });
     } catch (err) {
-      setCalibrationError(String(err));
+      const message = summarizeError(err);
+      setCalibrationError(message);
+      void appendTestEvent({
+        stage: "calibration",
+        action: "captureSnapshot",
+        message: "校准截图失败。",
+        details: {
+          error: message,
+          monitorId: selectedMonitor?.id,
+          saveSamples,
+          delaySeconds,
+        },
+      });
     } finally {
       setCalibrationLoading(false);
     }
@@ -803,12 +1017,24 @@ function App() {
   async function saveCalibrationProfile() {
     if (!calibrationSnapshot) {
       setCalibrationError("请先获取一次校准截图。");
+      void appendTestEvent({
+        stage: "calibration",
+        action: "saveProfile",
+        message: "校准配置保存未执行：缺少校准截图。",
+        details: { selectedRegionCount: REGION_DEFINITIONS.filter((definition) => regions[definition.key]).length },
+      });
       return;
     }
 
     const missingRegion = REGION_DEFINITIONS.find((definition) => !regions[definition.key]);
     if (missingRegion) {
       setCalibrationError(`请先框选 ${missingRegion.label}。`);
+      void appendTestEvent({
+        stage: "calibration",
+        action: "saveProfile",
+        message: `校准配置保存未执行：缺少 ${missingRegion.label}。`,
+        details: { missingRegion: missingRegion.key },
+      });
       return;
     }
 
@@ -835,8 +1061,31 @@ function App() {
       await invoke<void>("save_calibration_profile", { profile });
       setCalibrationProfile(profile);
       setCalibrationMessage("校准配置已保存。");
+      void appendTestEvent({
+        stage: "calibration",
+        action: "saveProfile",
+        message: "校准配置已保存。",
+        details: {
+          profileName: profile.profileName,
+          monitorId: profile.monitorId,
+          monitorName: profile.monitorName,
+          screenshotWidth: profile.screenshotWidth,
+          screenshotHeight: profile.screenshotHeight,
+          language: profile.language,
+          nameRegions: profile.nameRegions,
+          bottomAnchors: profile.bottomAnchors,
+          toggleButtonRegion: profile.toggleButtonRegion,
+        },
+      });
     } catch (err) {
-      setCalibrationError(String(err));
+      const message = summarizeError(err);
+      setCalibrationError(message);
+      void appendTestEvent({
+        stage: "calibration",
+        action: "saveProfile",
+        message: "校准配置保存失败。",
+        details: { error: message },
+      });
     } finally {
       setCalibrationSaving(false);
     }
@@ -855,8 +1104,34 @@ function App() {
       });
       setOverlayResult(result);
       writeOverlayState(result);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "open",
+        message: "Overlay POC 已打开。",
+        details: {
+          label: result.label,
+          target: result.target,
+          clickThroughRequested: result.clickThroughRequested,
+          clickThroughEnabled: result.clickThroughEnabled,
+          transparentEnabled: result.transparentEnabled,
+          cards: result.cards.map((card) => ({
+            slot: card.slot,
+            title: card.title,
+            bounds: card.bounds,
+            source: card.source,
+          })),
+          messages: result.messages,
+        },
+      });
     } catch (err) {
-      setOverlayError(String(err));
+      const message = summarizeError(err);
+      setOverlayError(message);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "open",
+        message: "Overlay POC 打开失败。",
+        details: { error: message },
+      });
     } finally {
       setOverlayLoading(false);
     }
@@ -868,8 +1143,24 @@ function App() {
     try {
       const result = await invoke<OverlayPocCloseResult>("close_overlay_poc");
       setOverlayCloseResult(result);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "close",
+        message: result.message,
+        details: {
+          label: result.label,
+          closed: result.closed,
+        },
+      });
     } catch (err) {
-      setOverlayError(String(err));
+      const message = summarizeError(err);
+      setOverlayError(message);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "close",
+        message: "Overlay POC 关闭失败。",
+        details: { error: message },
+      });
     } finally {
       setOverlayLoading(false);
     }
@@ -883,8 +1174,26 @@ function App() {
         enabled,
       });
       setOverlayClickThroughResult(result);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "setClickThrough",
+        message: result.message,
+        details: {
+          requested: result.requested,
+          applied: result.applied,
+          supported: result.supported,
+          label: result.label,
+        },
+      });
     } catch (err) {
-      setOverlayError(String(err));
+      const message = summarizeError(err);
+      setOverlayError(message);
+      void appendTestEvent({
+        stage: "overlay",
+        action: "setClickThrough",
+        message: "Overlay 点击穿透切换失败。",
+        details: { requested: enabled, error: message },
+      });
     } finally {
       setOverlayLoading(false);
     }
@@ -893,14 +1202,35 @@ function App() {
   async function runOcrPoc() {
     if (!calibrationProfile) {
       setOcrError("请先到校准页保存校准配置。");
+      void appendTestEvent({
+        stage: "ocr",
+        action: "run",
+        message: "OCR 未执行：缺少校准配置。",
+        details: { samplePath: calibrationSnapshot?.samplePath ?? null },
+      });
       return;
     }
     if (!calibrationSnapshot?.samplePath) {
       setOcrError("请先到校准页获取一张校准截图，再运行 OCR POC。");
+      void appendTestEvent({
+        stage: "ocr",
+        action: "run",
+        message: "OCR 未执行：缺少当前校准截图样本。",
+        details: { profileName: calibrationProfile.profileName },
+      });
       return;
     }
     if (calibrationProfile.nameRegions.length < 3) {
       setOcrError("校准配置缺少三块名称区域，请回到校准页补齐 nameRegions。");
+      void appendTestEvent({
+        stage: "ocr",
+        action: "run",
+        message: "OCR 未执行：校准配置缺少三块名称区域。",
+        details: {
+          profileName: calibrationProfile.profileName,
+          nameRegionCount: calibrationProfile.nameRegions.length,
+        },
+      });
       return;
     }
 
@@ -948,6 +1278,24 @@ function App() {
 
       setOcrResults(nextResults);
       setOcrChangedSlots(changedSlots);
+      void appendTestEvent({
+        stage: "ocr",
+        action: "run",
+        message: "三槽 OCR 识别完成。",
+        details: {
+          samplePath: calibrationSnapshot.samplePath,
+          profileName: calibrationProfile.profileName,
+          changedSlots,
+          results: nextResults.map((result) => ({
+            slot: result.slot,
+            rawText: result.rawText,
+            confidence: result.confidence,
+            matchedName: result.matchedName,
+            matchScore: result.matchScore,
+            status: result.status,
+          })),
+        },
+      });
       if (changedSlots.length === 1) {
         setOcrMessage(`slot ${changedSlots[0]} 标准名称变化，只刷新对应 slot。`);
       } else if (changedSlots.length > 1) {
@@ -956,7 +1304,18 @@ function App() {
         setOcrMessage("OCR 完成，标准名称未发生变化。");
       }
     } catch (err) {
-      setOcrError(String(err));
+      const message = summarizeError(err);
+      setOcrError(message);
+      void appendTestEvent({
+        stage: "ocr",
+        action: "run",
+        message: "三槽 OCR 识别失败。",
+        details: {
+          error: message,
+          samplePath: calibrationSnapshot.samplePath,
+          profileName: calibrationProfile.profileName,
+        },
+      });
     } finally {
       if (worker) {
         await worker.terminate();
@@ -971,6 +1330,7 @@ function App() {
     if (!nextName) {
       return;
     }
+    const previous = ocrResults.find((result) => result.slot === slot);
     setOcrResults((current) =>
       current.map((result) =>
         result.slot === slot
@@ -986,6 +1346,18 @@ function App() {
     );
     setOcrChangedSlots((current) => current.filter((changedSlot) => changedSlot !== slot));
     setOcrMessage(`slot ${slot} 已人工修正为 ${nextName}。`);
+    void appendTestEvent({
+      stage: "ocr",
+      action: "manualCorrection",
+      message: `slot ${slot} 已人工修正为 ${nextName}。`,
+      details: {
+        slot,
+        previousName: previous?.matchedName ?? null,
+        nextName,
+        rawText: previous?.rawText ?? null,
+        previousStatus: previous?.status ?? null,
+      },
+    });
   }
 
   return (
@@ -1125,6 +1497,13 @@ function App() {
               onSave={saveCalibrationProfile}
             />
           )}
+          <TestLogPanel
+            paths={testLogPaths}
+            message={testLogMessage}
+            loading={testLogLoading}
+            onReset={resetTestLog}
+            onRefresh={refreshTestLogPaths}
+          />
         </aside>
 
         <section className="content-panel">
@@ -1208,6 +1587,44 @@ function App() {
         </section>
       </section>
     </main>
+  );
+}
+
+function TestLogPanel({
+  paths,
+  message,
+  loading,
+  onReset,
+  onRefresh,
+}: {
+  paths: TestLogPaths | null;
+  message: string | null;
+  loading: boolean;
+  onReset: () => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <section className="test-log-panel">
+      <h2>测试留痕</h2>
+      <p className="muted">测完把日志路径告诉我也行；我可以直接读取这些文件。</p>
+      <dl>
+        <dt>目录</dt>
+        <dd>{paths?.dir ?? "等待读取"}</dd>
+        <dt>JSONL</dt>
+        <dd>{paths?.jsonlPath ?? "等待读取"}</dd>
+        <dt>Markdown</dt>
+        <dd>{paths?.mdPath ?? "等待读取"}</dd>
+      </dl>
+      <div className="button-stack">
+        <button className="secondary-button" onClick={onReset} disabled={loading} type="button">
+          {loading ? "处理中..." : "开始新测试日志"}
+        </button>
+        <button className="ghost-button" onClick={onRefresh} disabled={loading} type="button">
+          刷新日志路径
+        </button>
+      </div>
+      {message ? <p className="test-log-message">{message}</p> : null}
+    </section>
   );
 }
 
@@ -2953,8 +3370,24 @@ function formatDateTime(value: string) {
   return parsed.toLocaleString("zh-CN", { hour12: false });
 }
 
+function summarizeError(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
 function formatScore(value: number) {
   return Number.isFinite(value) ? value.toFixed(1) : "0.0";
+}
+
+function liveClientDetails(result: LiveClientActivePlayerResult): Record<string, unknown> {
+  return {
+    available: result.available,
+    championName: result.championName ?? null,
+    level: result.level ?? null,
+    checkedAt: result.checkedAt,
+    durationMs: result.durationMs,
+    error: result.error ? summarizeError(result.error) : null,
+  };
 }
 
 function apexQueryKey(championName: string, augmentName: string) {

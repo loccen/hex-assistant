@@ -5,6 +5,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     fs,
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     thread,
     time::{Duration, Instant},
@@ -280,6 +282,34 @@ pub struct ApexLolCacheFile {
     pub entries: BTreeMap<String, ApexLolAugmentResult>,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TestEventInput {
+    pub stage: String,
+    pub action: String,
+    pub message: String,
+    #[serde(default)]
+    pub details: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TestEvent {
+    pub stage: String,
+    pub action: String,
+    pub message: String,
+    pub details: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TestLogPaths {
+    pub dir: String,
+    pub jsonl_path: String,
+    pub md_path: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureAttempt {
@@ -316,6 +346,39 @@ pub struct DiagnosticReport {
 fn get_environment_snapshot(app: AppHandle) -> Result<EnvironmentSnapshot, String> {
     let app_data_dir = app_data_dir(&app)?;
     Ok(environment_snapshot(&app_data_dir))
+}
+
+#[tauri::command]
+fn append_test_event(app: AppHandle, event: TestEventInput) -> Result<TestEvent, String> {
+    write_test_event(&app, event)
+}
+
+#[tauri::command]
+fn get_test_log_paths(app: AppHandle) -> Result<TestLogPaths, String> {
+    let paths = test_log_paths(&app)?;
+    Ok(paths.to_public())
+}
+
+#[tauri::command]
+fn reset_test_log(app: AppHandle) -> Result<TestEvent, String> {
+    let paths = test_log_paths(&app)?;
+    fs::create_dir_all(&paths.dir).map_err(|err| err.to_string())?;
+    fs::write(&paths.jsonl_path, "").map_err(|err| err.to_string())?;
+    fs::write(
+        &paths.md_path,
+        "# 当前测试操作日志\n\n用于记录人工测试中的关键操作、路径、状态和错误摘要。\n\n",
+    )
+    .map_err(|err| err.to_string())?;
+
+    write_test_event(
+        &app,
+        TestEventInput {
+            stage: "testLog".to_string(),
+            action: "reset".to_string(),
+            message: "开始新的测试操作日志。".to_string(),
+            details: None,
+        },
+    )
 }
 
 #[tauri::command]
@@ -619,6 +682,9 @@ pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_environment_snapshot,
+            append_test_event,
+            get_test_log_paths,
+            reset_test_log,
             list_capture_targets,
             run_capture_diagnostic,
             capture_calibration_snapshot,
@@ -1285,6 +1351,95 @@ fn write_apex_lol_cache_entry(
     }
     let content = serde_json::to_string_pretty(&cache).map_err(|err| err.to_string())?;
     fs::write(path, content).map_err(|err| err.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct TestLogPathSet {
+    dir: PathBuf,
+    jsonl_path: PathBuf,
+    md_path: PathBuf,
+}
+
+impl TestLogPathSet {
+    fn to_public(&self) -> TestLogPaths {
+        TestLogPaths {
+            dir: self.dir.display().to_string(),
+            jsonl_path: self.jsonl_path.display().to_string(),
+            md_path: self.md_path.display().to_string(),
+        }
+    }
+}
+
+fn test_log_paths(app: &AppHandle) -> Result<TestLogPathSet, String> {
+    let dir = app_data_dir(app)?.join("test-runs");
+    Ok(TestLogPathSet {
+        jsonl_path: dir.join("current-test-log.jsonl"),
+        md_path: dir.join("current-test-log.md"),
+        dir,
+    })
+}
+
+fn write_test_event(app: &AppHandle, input: TestEventInput) -> Result<TestEvent, String> {
+    let paths = test_log_paths(app)?;
+    fs::create_dir_all(&paths.dir).map_err(|err| err.to_string())?;
+    ensure_test_log_header(&paths.md_path)?;
+
+    let event = TestEvent {
+        stage: input.stage.trim().to_string(),
+        action: input.action.trim().to_string(),
+        message: input.message.trim().to_string(),
+        details: input.details,
+        created_at: Utc::now(),
+    };
+
+    let json_line = serde_json::to_string(&event).map_err(|err| err.to_string())?;
+    append_line(&paths.jsonl_path, &json_line)?;
+    append_line(&paths.md_path, &render_test_event_markdown(&event))?;
+    Ok(event)
+}
+
+fn ensure_test_log_header(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    fs::write(
+        path,
+        "# 当前测试操作日志\n\n用于记录人工测试中的关键操作、路径、状态和错误摘要。\n\n",
+    )
+    .map_err(|err| err.to_string())
+}
+
+fn append_line(path: &Path, line: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| err.to_string())?;
+    writeln!(file, "{}", line).map_err(|err| err.to_string())
+}
+
+fn render_test_event_markdown(event: &TestEvent) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "## {} · {} / {}",
+        event.created_at, event.stage, event.action
+    ));
+    lines.push(String::new());
+    lines.push(format!("- 说明：{}", event.message));
+    if let Some(details) = &event.details {
+        lines.push(format!("- 详情：{}", compact_json(details)));
+    }
+    lines.join("\n")
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
