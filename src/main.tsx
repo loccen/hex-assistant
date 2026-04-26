@@ -290,7 +290,7 @@ const REGION_DEFINITIONS: RegionDefinition[] = [
   { key: "anchor-1", label: "锚点 slot1", summary: "第一张底部锚点区域", group: "anchor", slot: 1 },
   { key: "anchor-2", label: "锚点 slot2", summary: "第二张底部锚点区域", group: "anchor", slot: 2 },
   { key: "anchor-3", label: "锚点 slot3", summary: "第三张底部锚点区域", group: "anchor", slot: 3 },
-  { key: "toggle", label: "展开按钮", summary: "底部展开/收起按钮区域", group: "toggle" },
+  { key: "toggle", label: "收起/展开按钮", summary: "底部收起/展开按钮区域（折叠判定）", group: "toggle" },
 ];
 
 const EMPTY_REGIONS: RegionMap = {
@@ -928,12 +928,15 @@ function App() {
       });
       return;
     }
-    if (visualInput.buttonVisible) {
-      addStateMachineEvent("标记当前轮完成被拦截：按钮仍存在，卡片消失不等于完成。");
+    if (visualInput.cardsExpanded || visualInput.buttonVisible) {
+      const reason = visualInput.cardsExpanded
+        ? "卡片仍展开，按钮区可能被详情浮层遮挡。"
+        : "按钮仍存在，卡片消失不等于完成。";
+      addStateMachineEvent(`标记当前轮完成被拦截：${reason}`);
       void appendTestEvent({
         stage: "stateMachine",
         action: "completeCurrentMilestone",
-        message: "标记当前轮完成被拦截：按钮仍存在。",
+        message: `标记当前轮完成被拦截：${reason}`,
         details: {
           milestone,
           visualInput,
@@ -2341,7 +2344,7 @@ function StateMachineWorkspace({
   onCompleteCurrentMilestone: () => void;
 }) {
   const currentMilestone = pendingMilestoneQueue[0] ?? null;
-  const canCompleteCurrentRound = Boolean(currentMilestone) && !visualInput.buttonVisible;
+  const canCompleteCurrentRound = Boolean(currentMilestone) && !visualInput.cardsExpanded && !visualInput.buttonVisible;
   const sortedOcrResults = ocrResults.slice().sort((left, right) => left.slot - right.slot);
 
   return (
@@ -2425,7 +2428,7 @@ function StateMachineWorkspace({
             标记当前轮完成
           </button>
           <p className="muted">
-            按钮仍存在时不能标记完成；卡片消失不等于完成，只有按钮消失才允许阶段结束。
+            卡片仍展开时不能标记完成；按钮区可能被符文详情浮层遮挡，只有卡片不可见且按钮消失才允许手动标记当前轮完成。
           </p>
         </section>
       </div>
@@ -2464,7 +2467,7 @@ function StateMachineWorkspace({
             </button>
           </div>
           <p className="muted">
-            按钮存在且卡片收起会提示隐藏 Overlay 且不标记完成；按钮存在且卡片展开时允许使用三 slot 名称。
+            卡片展开优先于按钮区域：即使按钮区被符文详情浮层遮挡，也保持面板展开并允许使用三 slot 名称。按钮只在卡片不可见时用于判断入口折叠或阶段结束。
           </p>
         </div>
 
@@ -2507,9 +2510,10 @@ function StateMachineWorkspace({
         <h2>状态机规则说明</h2>
         <ul className="rule-list">
           <li>接口 unavailable 或等级低于 3：保持普通监听。</li>
-          <li>有待处理档位且按钮不存在：进入可触发状态。</li>
+          <li>有待处理档位且卡片展开：进入展开状态，可使用三 slot 名称，允许 OCR / Overlay。</li>
+          <li>卡片不可见且按钮不存在：进入可触发状态，等待入口出现或确认阶段结束。</li>
           <li>按钮存在且卡片收起：认为入口折叠，提示隐藏 Overlay，不标记完成。</li>
-          <li>按钮存在且卡片展开：进入展开状态，可使用三 slot 名称。</li>
+          <li>按钮区域可能被符文详情浮层遮挡；按钮只在卡片不可见时用于收起 / 阶段结束判断。</li>
           <li>点击“标记当前轮完成”只移除队列首个档位；多档位会按 3、7、11、15 依次处理。</li>
         </ul>
       </section>
@@ -3027,7 +3031,7 @@ function CalibrationProfileSummary({ profile }: { profile: CalibrationProfile })
         {profile.bottomAnchors.map((region) => (
           <span key={`anchor-${region.slot}`}>锚点 slot{region.slot}：{formatRegion(region)}</span>
         ))}
-        <span>展开按钮：{formatRegion(profile.toggleButtonRegion)}</span>
+        <span>收起/展开按钮（折叠判定）：{formatRegion(profile.toggleButtonRegion)}</span>
       </div>
     </section>
   );
@@ -3332,11 +3336,11 @@ function deriveStateMachineStatus(
     const allMilestonesCompleted = AUGMENT_MILESTONES.every((milestone) => completedMilestones.includes(milestone));
     return allMilestonesCompleted ? "AUGMENT_STAGE_COMPLETED" : "AUGMENT_ROUND_COMPLETED";
   }
-  if (!visualInput.buttonVisible) {
-    return "AUGMENT_ELIGIBLE";
-  }
   if (visualInput.cardsExpanded) {
     return "AUGMENT_EXPANDED";
+  }
+  if (!visualInput.buttonVisible) {
+    return "AUGMENT_ELIGIBLE";
   }
   return "AUGMENT_COLLAPSED";
 }
@@ -3383,13 +3387,13 @@ function formatStateMachineStatus(status: StateMachineStatus) {
     case "IN_GAME_MONITORING":
       return "普通监听：接口不可用、未进入游戏或等级低于 3。";
     case "AUGMENT_ELIGIBLE":
-      return "有待处理档位，但按钮当前不存在，等待人工确认入口出现。";
+      return "有待处理档位，卡片不可见且按钮当前不存在，等待入口出现或确认阶段结束。";
     case "AUGMENT_STAGE_ACTIVE":
       return "海克斯阶段已激活。";
     case "AUGMENT_COLLAPSED":
       return "按钮存在且卡片收起：应隐藏 Overlay，不标记完成。";
     case "AUGMENT_EXPANDED":
-      return "按钮存在且卡片展开：可以使用三 slot 名称。";
+      return "卡片展开：可以使用三 slot 名称；按钮区被详情浮层遮挡也不影响 OCR / Overlay。";
     case "AUGMENT_ROUND_COMPLETED":
       return "当前等级已触发的档位都已完成，继续监听后续等级。";
     case "AUGMENT_STAGE_COMPLETED":
