@@ -1488,7 +1488,7 @@ function App() {
           ) : mode === "stateMachine" ? (
             <StateMachineControls
               loading={liveClientLoading}
-              canComplete={Boolean(pendingMilestoneQueue[0]) && !visualInput.buttonVisible}
+              canComplete={Boolean(pendingMilestoneQueue[0]) && !visualInput.cardsExpanded && !visualInput.buttonVisible}
               onRefresh={refreshLiveClientActivePlayer}
               onComplete={completeCurrentMilestone}
             />
