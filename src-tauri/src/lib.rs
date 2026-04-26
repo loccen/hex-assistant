@@ -10,24 +10,14 @@ use std::{
     thread,
     time::Duration,
 };
-use sysinfo::System;
 use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureRequest {
-    pub target: CaptureTargetKind,
     pub save_samples: bool,
     #[serde(default)]
     pub delay_seconds: u64,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-pub enum CaptureTargetKind {
-    PrimaryMonitor,
-    LolWindow,
-    ForegroundWindow,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -37,7 +27,6 @@ pub struct CaptureTarget {
     pub id: String,
     pub label: String,
     pub bounds: Option<RectInfo>,
-    pub is_lol_candidate: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -51,13 +40,6 @@ pub struct RectInfo {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct ProcessInfo {
-    pub pid: String,
-    pub name: String,
-}
-
-#[derive(Debug, Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 pub struct EnvironmentSnapshot {
     pub os: String,
     pub arch: String,
@@ -65,7 +47,6 @@ pub struct EnvironmentSnapshot {
     pub app_data_dir: String,
     pub rust_target_os: String,
     pub rust_target_arch: String,
-    pub lol_processes: Vec<ProcessInfo>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -176,7 +157,7 @@ pub fn run() {
             run_capture_diagnostic
         ])
         .run(tauri::generate_context!())
-        .expect("启动 LOL 海克斯乱斗助手截图诊断失败");
+        .expect("启动屏幕截图诊断工具失败");
 }
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -192,33 +173,7 @@ fn environment_snapshot(app_data_dir: &Path) -> EnvironmentSnapshot {
         app_data_dir: app_data_dir.display().to_string(),
         rust_target_os: std::env::consts::OS.to_string(),
         rust_target_arch: std::env::consts::ARCH.to_string(),
-        lol_processes: detect_lol_processes(),
     }
-}
-
-fn detect_lol_processes() -> Vec<ProcessInfo> {
-    let mut system = System::new_all();
-    system.refresh_processes();
-
-    let mut processes: Vec<ProcessInfo> = system
-        .processes()
-        .iter()
-        .filter_map(|(pid, process)| {
-            let name = process.name().to_string();
-            let lower = name.to_lowercase();
-            let is_lol = lower.contains("league")
-                || lower.contains("riot")
-                || lower.contains("lol")
-                || lower.contains("英雄联盟");
-            is_lol.then(|| ProcessInfo {
-                pid: pid.to_string(),
-                name,
-            })
-        })
-        .collect();
-
-    processes.sort_by(|a, b| a.name.cmp(&b.name));
-    processes
 }
 
 fn summarize_attempts(attempts: &[CaptureAttempt]) -> String {
@@ -244,7 +199,6 @@ fn render_log(report: &DiagnosticReport) -> String {
     let mut lines = Vec::new();
     lines.push(format!("诊断编号: {}", report.id));
     lines.push(format!("生成时间: {}", report.created_at));
-    lines.push(format!("目标: {:?}", report.request.target));
     lines.push(format!("保存样本: {}", report.request.save_samples));
     lines.push(format!("延迟截图: {} 秒", report.request.delay_seconds));
     lines.push(String::new());
@@ -256,19 +210,12 @@ fn render_log(report: &DiagnosticReport) -> String {
         report.environment.rust_target_os, report.environment.rust_target_arch
     ));
     lines.push(format!("应用数据目录: {}", report.environment.app_data_dir));
-    lines.push(format!(
-        "LOL/Riot 相关进程数: {}",
-        report.environment.lol_processes.len()
-    ));
-    for process in &report.environment.lol_processes {
-        lines.push(format!("  - pid={} name={}", process.pid, process.name));
-    }
     lines.push(String::new());
     lines.push("[捕获目标]".to_string());
     for target in &report.targets {
         lines.push(format!(
-            "  - kind={} id={} label={} bounds={:?} lol_candidate={}",
-            target.kind, target.id, target.label, target.bounds, target.is_lol_candidate
+            "  - kind={} id={} label={} bounds={:?}",
+            target.kind, target.id, target.label, target.bounds
         ));
     }
     lines.push(String::new());
@@ -374,12 +321,7 @@ fn failed_attempt(
 #[cfg(windows)]
 fn sample_path(report_dir: &Path, strategy: &str, request: &CaptureRequest) -> Option<PathBuf> {
     request.save_samples.then(|| {
-        let name = format!(
-            "{}-{}.png",
-            strategy,
-            format!("{:?}", request.target).to_lowercase()
-        )
-        .replace([' ', ':', '\\', '/'], "_");
+        let name = format!("{}.png", strategy).replace([' ', ':', '\\', '/'], "_");
         report_dir.join(name)
     })
 }
@@ -448,29 +390,27 @@ mod platform {
             id: "unsupported".to_string(),
             label: "当前不是 Windows，真实截图诊断需在 Windows 桌面环境运行".to_string(),
             bounds: None,
-            is_lol_candidate: false,
         }]
     }
 
     pub fn run_capture_diagnostic(
-        request: &CaptureRequest,
+        _request: &CaptureRequest,
         _report_dir: &Path,
     ) -> Vec<CaptureAttempt> {
-        let target = format!("{:?}", request.target);
         vec![
             failed_attempt(
                 "xcap_requested_target",
-                &target,
+                "primary_monitor",
                 "当前平台不是 Windows，跳过真实截图",
             ),
             failed_attempt(
                 "xcap_primary_monitor",
-                &target,
+                "primary_monitor",
                 "当前平台不是 Windows，跳过主显示器截图",
             ),
             failed_attempt(
                 "xcap_center_region",
-                &target,
+                "primary_monitor",
                 "当前平台不是 Windows，跳过中心区域截图",
             ),
         ]
@@ -480,7 +420,7 @@ mod platform {
 #[cfg(windows)]
 mod platform {
     use super::*;
-    use xcap::{Monitor, Window};
+    use xcap::Monitor;
 
     pub fn list_capture_targets() -> Vec<CaptureTarget> {
         let mut targets = Vec::new();
@@ -504,36 +444,6 @@ mod platform {
                     id: format!("monitor-{}", index),
                     label,
                     bounds,
-                    is_lol_candidate: false,
-                });
-            }
-        }
-
-        if let Ok(windows) = Window::all() {
-            for window in windows.into_iter().take(80) {
-                let title = window.title().unwrap_or_default();
-                if title.trim().is_empty() {
-                    continue;
-                }
-                let is_lol_candidate = is_lol_title(&title);
-                let bounds = match (window.x(), window.y(), window.width(), window.height()) {
-                    (Ok(x), Ok(y), Ok(width), Ok(height)) => Some(RectInfo {
-                        x,
-                        y,
-                        width,
-                        height,
-                    }),
-                    _ => None,
-                };
-                targets.push(CaptureTarget {
-                    kind: "window".to_string(),
-                    id: window
-                        .id()
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|_| "unknown".to_string()),
-                    label: title,
-                    bounds,
-                    is_lol_candidate,
                 });
             }
         }
@@ -545,46 +455,26 @@ mod platform {
         request: &CaptureRequest,
         report_dir: &Path,
     ) -> Vec<CaptureAttempt> {
-        let target = format!("{:?}", request.target);
         vec![
             build_attempt(
                 "xcap_requested_target",
-                &target,
+                "primary_monitor",
                 sample_path(report_dir, "xcap_requested_target", request),
-                |path| capture_with_xcap(request, path),
+                capture_monitor_with_xcap,
             ),
             build_attempt(
                 "xcap_primary_monitor",
-                &target,
+                "primary_monitor",
                 sample_path(report_dir, "xcap_primary_monitor", request),
-                |path| capture_monitor_with_xcap(path),
+                capture_monitor_with_xcap,
             ),
             build_attempt(
                 "xcap_center_region",
-                &target,
+                "primary_monitor",
                 sample_path(report_dir, "xcap_center_region", request),
-                |path| capture_center_region_with_xcap(path),
+                capture_center_region_with_xcap,
             ),
         ]
-    }
-
-    fn capture_with_xcap(
-        request: &CaptureRequest,
-        save_path: Option<&Path>,
-    ) -> Result<CapturedImage, String> {
-        match request.target {
-            CaptureTargetKind::PrimaryMonitor => capture_monitor_with_xcap(save_path),
-            CaptureTargetKind::LolWindow => {
-                let window = find_xcap_lol_window()?;
-                let image = window.capture_image().map_err(|err| err.to_string())?;
-                save_xcap_image(image, save_path)
-            }
-            CaptureTargetKind::ForegroundWindow => {
-                let window = find_xcap_foreground_like_window()?;
-                let image = window.capture_image().map_err(|err| err.to_string())?;
-                save_xcap_image(image, save_path)
-            }
-        }
     }
 
     fn capture_monitor_with_xcap(save_path: Option<&Path>) -> Result<CapturedImage, String> {
@@ -630,39 +520,5 @@ mod platform {
             rgba: image.into_raw(),
             saved_path: save_path.map(Path::to_path_buf),
         })
-    }
-
-    fn find_xcap_lol_window() -> Result<Window, String> {
-        Window::all()
-            .map_err(|err| err.to_string())?
-            .into_iter()
-            .find(|window| {
-                window
-                    .title()
-                    .map(|title| is_lol_title(&title))
-                    .unwrap_or(false)
-            })
-            .ok_or_else(|| "未找到 LOL 窗口".to_string())
-    }
-
-    fn find_xcap_foreground_like_window() -> Result<Window, String> {
-        Window::all()
-            .map_err(|err| err.to_string())?
-            .into_iter()
-            .find(|window| {
-                !window.is_minimized().unwrap_or(false)
-                    && window.width().unwrap_or(0) > 80
-                    && window.height().unwrap_or(0) > 80
-                    && !window.title().unwrap_or_default().trim().is_empty()
-            })
-            .ok_or_else(|| "未找到可捕获的前台候选窗口".to_string())
-    }
-
-    fn is_lol_title(title: &str) -> bool {
-        let lower = title.to_lowercase();
-        lower.contains("league of legends")
-            || lower.contains("英雄联盟")
-            || lower.contains("riot")
-            || lower.contains("lol")
     }
 }

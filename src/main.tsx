@@ -1,9 +1,7 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { invoke } from "@tauri-apps/api/core";
 import "./styles.css";
-
-type CaptureTargetKind = "primaryMonitor" | "lolWindow" | "foregroundWindow";
 
 type RectInfo = {
   x: number;
@@ -17,12 +15,6 @@ type CaptureTarget = {
   id: string;
   label: string;
   bounds?: RectInfo | null;
-  isLolCandidate: boolean;
-};
-
-type ProcessInfo = {
-  pid: string;
-  name: string;
 };
 
 type EnvironmentSnapshot = {
@@ -32,7 +24,6 @@ type EnvironmentSnapshot = {
   appDataDir: string;
   rustTargetOs: string;
   rustTargetArch: string;
-  lolProcesses: ProcessInfo[];
 };
 
 type PixelMetrics = {
@@ -61,7 +52,6 @@ type DiagnosticReport = {
   id: string;
   createdAt: string;
   request: {
-    target: CaptureTargetKind;
     saveSamples: boolean;
     delaySeconds: number;
   };
@@ -74,26 +64,7 @@ type DiagnosticReport = {
   jsonPath: string;
 };
 
-const targetOptions: Array<{ value: CaptureTargetKind; label: string; hint: string }> = [
-  {
-    value: "primaryMonitor",
-    label: "主显示器",
-    hint: "适合 LOL 独占全屏和无边框场景",
-  },
-  {
-    value: "lolWindow",
-    label: "LOL 窗口",
-    hint: "按窗口标题寻找 League of Legends / 英雄联盟",
-  },
-  {
-    value: "foregroundWindow",
-    label: "当前前台窗口",
-    hint: "你把 LOL 切到最前面后再运行",
-  },
-];
-
 function App() {
-  const [target, setTarget] = useState<CaptureTargetKind>("primaryMonitor");
   const [saveSamples, setSaveSamples] = useState(true);
   const [delaySeconds, setDelaySeconds] = useState(8);
   const [environment, setEnvironment] = useState<EnvironmentSnapshot | null>(null);
@@ -126,7 +97,6 @@ function App() {
     try {
       const result = await invoke<DiagnosticReport>("run_capture_diagnostic", {
         request: {
-          target,
           saveSamples,
           delaySeconds,
         },
@@ -141,17 +111,12 @@ function App() {
     }
   }
 
-  const lolTargets = useMemo(
-    () => targets.filter((item) => item.isLolCandidate),
-    [targets],
-  );
-
   return (
     <main className="app-shell">
       <section className="top-bar">
         <div>
-          <h1>LOL 海克斯乱斗助手截图诊断</h1>
-          <p>第一阶段只验证全屏、无边框、窗口模式下能否稳定截图，并导出日志和样本。</p>
+          <h1>屏幕截图诊断工具</h1>
+          <p>第一阶段只验证目标画面在全屏、无边框、窗口模式下能否稳定截图，并导出日志和样本。</p>
         </div>
         <button className="ghost-button" onClick={refresh} disabled={loading}>
           刷新环境
@@ -163,25 +128,11 @@ function App() {
       <section className="workspace">
         <aside className="control-panel">
           <h2>诊断目标</h2>
-          <div className="target-list">
-            {targetOptions.map((option) => (
-              <label
-                key={option.value}
-                className={option.value === target ? "target-option selected" : "target-option"}
-              >
-                <input
-                  type="radio"
-                  name="target"
-                  value={option.value}
-                  checked={target === option.value}
-                  onChange={() => setTarget(option.value)}
-                />
-                <span>
-                  <strong>{option.label}</strong>
-                  <small>{option.hint}</small>
-                </span>
-              </label>
-            ))}
+          <div className="target-option selected static-target">
+            <span>
+              <strong>主显示器</strong>
+              <small>只做显示器级截图，不扫描进程，不按窗口标题查找目标。</small>
+            </span>
           </div>
 
           <label className="check-row">
@@ -207,7 +158,7 @@ function App() {
               <option value={12}>12 秒</option>
               <option value={20}>20 秒</option>
             </select>
-            <small>全屏测试时点击诊断后立刻切回 LOL，等待自动截图。</small>
+            <small>全屏测试时点击诊断后立刻切回目标画面，等待自动截图。</small>
           </div>
 
           <button className="primary-button" onClick={runDiagnostic} disabled={loading}>
@@ -229,7 +180,7 @@ function App() {
         </aside>
 
         <section className="content-panel">
-          <EnvironmentView environment={environment} targets={targets} lolTargets={lolTargets} />
+          <EnvironmentView environment={environment} targets={targets} />
           {report ? <ReportView report={report} /> : <EmptyState />}
         </section>
       </section>
@@ -240,11 +191,9 @@ function App() {
 function EnvironmentView({
   environment,
   targets,
-  lolTargets,
 }: {
   environment: EnvironmentSnapshot | null;
   targets: CaptureTarget[];
-  lolTargets: CaptureTarget[];
 }) {
   return (
     <section className="info-grid">
@@ -267,20 +216,9 @@ function EnvironmentView({
       </div>
 
       <div className="info-panel">
-        <h2>LOL 状态</h2>
-        {environment && environment.lolProcesses.length > 0 ? (
-          <ul className="plain-list">
-            {environment.lolProcesses.map((process) => (
-              <li key={`${process.pid}-${process.name}`}>
-                <span>{process.name}</span>
-                <small>pid {process.pid}</small>
-              </li>
-            ))}
-          </ul>
-        ) : (
-          <p className="muted">暂未发现 League / Riot 相关进程。</p>
-        )}
-        <p className="metric-line">疑似 LOL 窗口：{lolTargets.length}</p>
+        <h2>诊断范围</h2>
+        <p className="muted">当前版本只枚举显示器并执行显示器截图，不读取游戏进程列表，不枚举窗口标题。</p>
+        <p className="metric-line">显示器数量：{targets.length}</p>
       </div>
 
       <div className="info-panel">
@@ -355,7 +293,7 @@ function EmptyState() {
   return (
     <section className="empty-state">
       <h2>等待诊断</h2>
-      <p>运行前请把 LOL 切到你要测试的显示模式。全屏测试优先选择“主显示器”。</p>
+      <p>运行前请把目标画面切到要测试的显示模式。全屏测试建议使用延迟截图。</p>
     </section>
   );
 }

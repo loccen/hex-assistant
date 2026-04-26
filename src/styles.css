@@ -102,6 +102,12 @@ h2 {
   background: #eef7f1;
 }
 
+.target-option.static-target {
+  grid-template-columns: minmax(0, 1fr);
+  cursor: default;
+  margin: 16px 0;
+}
+
 .target-option span {
   display: grid;
   gap: 4px;
