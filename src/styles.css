@@ -18,7 +18,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -118,6 +119,31 @@ h2 {
   align-items: center;
   gap: 8px;
   margin: 18px 0;
+}
+
+.delay-field {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 18px;
+}
+
+.delay-field label {
+  font-weight: 700;
+}
+
+.delay-field select {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #20242b;
+  background: #ffffff;
+  border: 1px solid #cfd5cc;
+  border-radius: 7px;
+}
+
+.delay-field small {
+  color: #69707a;
+  line-height: 1.35;
 }
 
 .primary-button,

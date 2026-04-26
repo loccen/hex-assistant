@@ -60,6 +60,11 @@ type CaptureAttempt = {
 type DiagnosticReport = {
   id: string;
   createdAt: string;
+  request: {
+    target: CaptureTargetKind;
+    saveSamples: boolean;
+    delaySeconds: number;
+  };
   environment: EnvironmentSnapshot;
   targets: CaptureTarget[];
   attempts: CaptureAttempt[];
@@ -90,6 +95,7 @@ const targetOptions: Array<{ value: CaptureTargetKind; label: string; hint: stri
 function App() {
   const [target, setTarget] = useState<CaptureTargetKind>("primaryMonitor");
   const [saveSamples, setSaveSamples] = useState(true);
+  const [delaySeconds, setDelaySeconds] = useState(8);
   const [environment, setEnvironment] = useState<EnvironmentSnapshot | null>(null);
   const [targets, setTargets] = useState<CaptureTarget[]>([]);
   const [report, setReport] = useState<DiagnosticReport | null>(null);
@@ -122,6 +128,7 @@ function App() {
         request: {
           target,
           saveSamples,
+          delaySeconds,
         },
       });
       setReport(result);
@@ -186,8 +193,29 @@ function App() {
             保存截图样本
           </label>
 
+          <div className="delay-field">
+            <label htmlFor="delaySeconds">延迟截图</label>
+            <select
+              id="delaySeconds"
+              value={delaySeconds}
+              onChange={(event) => setDelaySeconds(Number(event.currentTarget.value))}
+              disabled={loading}
+            >
+              <option value={0}>立即</option>
+              <option value={5}>5 秒</option>
+              <option value={8}>8 秒</option>
+              <option value={12}>12 秒</option>
+              <option value={20}>20 秒</option>
+            </select>
+            <small>全屏测试时点击诊断后立刻切回 LOL，等待自动截图。</small>
+          </div>
+
           <button className="primary-button" onClick={runDiagnostic} disabled={loading}>
-            {loading ? "诊断中..." : "运行截图诊断"}
+            {loading
+              ? delaySeconds > 0
+                ? `等待 ${delaySeconds} 秒后截图...`
+                : "诊断中..."
+              : "运行截图诊断"}
           </button>
 
           {report ? (

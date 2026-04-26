@@ -7,6 +7,8 @@ use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 use sysinfo::System;
 use tauri::{AppHandle, Manager};
@@ -16,6 +18,8 @@ use tauri::{AppHandle, Manager};
 pub struct CaptureRequest {
     pub target: CaptureTargetKind,
     pub save_samples: bool,
+    #[serde(default)]
+    pub delay_seconds: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -125,6 +129,11 @@ fn run_capture_diagnostic(
     let id = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let report_dir = base_dir.join("diagnostics").join(&id);
     fs::create_dir_all(&report_dir).map_err(|err| err.to_string())?;
+
+    let delay_seconds = request.delay_seconds.min(30);
+    if delay_seconds > 0 {
+        thread::sleep(Duration::from_secs(delay_seconds));
+    }
 
     let environment = environment_snapshot(&base_dir);
     let targets = platform::list_capture_targets();
@@ -237,6 +246,7 @@ fn render_log(report: &DiagnosticReport) -> String {
     lines.push(format!("生成时间: {}", report.created_at));
     lines.push(format!("目标: {:?}", report.request.target));
     lines.push(format!("保存样本: {}", report.request.save_samples));
+    lines.push(format!("延迟截图: {} 秒", report.request.delay_seconds));
     lines.push(String::new());
     lines.push("[环境]".to_string());
     lines.push(format!("OS: {}", report.environment.os));
