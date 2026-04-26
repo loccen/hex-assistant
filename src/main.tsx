@@ -45,6 +45,9 @@ type CaptureAttempt = {
   savedPath?: string | null;
   imageHash?: string | null;
   blackScreenSuspected?: boolean | null;
+  staleFrameSuspected?: boolean | null;
+  matchedPreviousReport?: string | null;
+  matchedPreviousStrategy?: string | null;
   metrics?: PixelMetrics | null;
   error?: string | null;
 };
@@ -55,6 +58,8 @@ type DiagnosticReport = {
   request: {
     saveSamples: boolean;
     delaySeconds: number;
+    displayModeNote?: string | null;
+    mapNote?: string | null;
   };
   environment: EnvironmentSnapshot;
   targets: CaptureTarget[];
@@ -359,6 +364,8 @@ function App() {
   const [environment, setEnvironment] = useState<EnvironmentSnapshot | null>(null);
   const [targets, setTargets] = useState<CaptureTarget[]>([]);
   const [report, setReport] = useState<DiagnosticReport | null>(null);
+  const [diagnosticDisplayModeNote, setDiagnosticDisplayModeNote] = useState("");
+  const [diagnosticMapNote, setDiagnosticMapNote] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testLogPaths, setTestLogPaths] = useState<TestLogPaths | null>(null);
@@ -561,6 +568,8 @@ function App() {
         request: {
           saveSamples,
           delaySeconds,
+          displayModeNote: diagnosticDisplayModeNote.trim() || null,
+          mapNote: diagnosticMapNote.trim() || null,
         },
       });
       setReport(result);
@@ -575,10 +584,19 @@ function App() {
           logPath: result.logPath,
           jsonPath: result.jsonPath,
           summary: result.summary,
+          request: {
+            displayModeNote: result.request.displayModeNote ?? null,
+            mapNote: result.request.mapNote ?? null,
+          },
           attempts: result.attempts.map((attempt) => ({
             strategy: attempt.strategy,
             status: attempt.status,
             savedPath: attempt.savedPath,
+            imageHash: attempt.imageHash,
+            blackScreenSuspected: attempt.blackScreenSuspected ?? null,
+            staleFrameSuspected: attempt.staleFrameSuspected ?? null,
+            matchedPreviousReport: attempt.matchedPreviousReport ?? null,
+            matchedPreviousStrategy: attempt.matchedPreviousStrategy ?? null,
             error: attempt.error ? summarizeError(attempt.error) : null,
           })),
         },
@@ -590,7 +608,13 @@ function App() {
         stage: "diagnostic",
         action: "runCaptureDiagnostic",
         message: "截图诊断失败。",
-        details: { error: message, saveSamples, delaySeconds },
+        details: {
+          error: message,
+          saveSamples,
+          delaySeconds,
+          displayModeNote: diagnosticDisplayModeNote.trim() || null,
+          mapNote: diagnosticMapNote.trim() || null,
+        },
       });
     } finally {
       setLoading(false);
@@ -1463,10 +1487,14 @@ function App() {
             <DiagnosticControls
               saveSamples={saveSamples}
               delaySeconds={delaySeconds}
+              displayModeNote={diagnosticDisplayModeNote}
+              mapNote={diagnosticMapNote}
               loading={loading}
               report={report}
               onSaveSamplesChange={setSaveSamples}
               onDelaySecondsChange={setDelaySeconds}
+              onDisplayModeNoteChange={setDiagnosticDisplayModeNote}
+              onMapNoteChange={setDiagnosticMapNote}
               onRunDiagnostic={runDiagnostic}
             />
           ) : mode === "overlay" ? (
@@ -1668,18 +1696,26 @@ function TestLogPanel({
 function DiagnosticControls({
   saveSamples,
   delaySeconds,
+  displayModeNote,
+  mapNote,
   loading,
   report,
   onSaveSamplesChange,
   onDelaySecondsChange,
+  onDisplayModeNoteChange,
+  onMapNoteChange,
   onRunDiagnostic,
 }: {
   saveSamples: boolean;
   delaySeconds: number;
+  displayModeNote: string;
+  mapNote: string;
   loading: boolean;
   report: DiagnosticReport | null;
   onSaveSamplesChange: (value: boolean) => void;
   onDelaySecondsChange: (value: number) => void;
+  onDisplayModeNoteChange: (value: string) => void;
+  onMapNoteChange: (value: string) => void;
   onRunDiagnostic: () => void;
 }) {
   return (
@@ -1699,6 +1735,28 @@ function DiagnosticControls({
         onSaveSamplesChange={onSaveSamplesChange}
         onDelaySecondsChange={onDelaySecondsChange}
       />
+
+      <div className="delay-field">
+        <label htmlFor="diagnosticDisplayModeNote">显示模式备注</label>
+        <input
+          id="diagnosticDisplayModeNote"
+          value={displayModeNote}
+          onChange={(event) => onDisplayModeNoteChange(event.currentTarget.value)}
+          placeholder="窗口 / 无边框 / 全屏"
+          disabled={loading}
+        />
+      </div>
+
+      <div className="delay-field">
+        <label htmlFor="diagnosticMapNote">地图备注</label>
+        <input
+          id="diagnosticMapNote"
+          value={mapNote}
+          onChange={(event) => onMapNoteChange(event.currentTarget.value)}
+          placeholder="嚎哭深渊 / 莲华栈桥 / 屠夫之桥"
+          disabled={loading}
+        />
+      </div>
 
       <button className="primary-button" onClick={onRunDiagnostic} disabled={loading} type="button">
         {loading ? (delaySeconds > 0 ? `等待 ${delaySeconds} 秒后截图...` : "诊断中...") : "运行截图诊断"}
@@ -3044,6 +3102,9 @@ function ReportView({ report }: { report: DiagnosticReport }) {
         <div>
           <h2>诊断结果</h2>
           <p>{report.summary}</p>
+          <p>
+            显示模式：{report.request.displayModeNote?.trim() || "未填写"}；地图：{report.request.mapNote?.trim() || "未填写"}
+          </p>
         </div>
         <span className="report-id">{report.id}</span>
       </div>
@@ -3071,6 +3132,22 @@ function ReportView({ report }: { report: DiagnosticReport }) {
                   : attempt.blackScreenSuspected
                     ? "疑似黑屏"
                     : "未疑似黑屏"}
+              </dd>
+              <dt>旧帧判断</dt>
+              <dd>
+                {attempt.staleFrameSuspected == null
+                  ? "-"
+                  : attempt.staleFrameSuspected
+                    ? "疑似旧帧"
+                    : "未匹配历史哈希"}
+              </dd>
+              <dt>历史匹配</dt>
+              <dd>
+                {attempt.matchedPreviousReport
+                  ? `${attempt.matchedPreviousReport}${
+                      attempt.matchedPreviousStrategy ? ` / ${attempt.matchedPreviousStrategy}` : ""
+                    }`
+                  : "-"}
               </dd>
               <dt>样本</dt>
               <dd>{attempt.savedPath ?? "-"}</dd>

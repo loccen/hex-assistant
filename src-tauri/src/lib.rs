@@ -28,6 +28,10 @@ pub struct CaptureRequest {
     pub save_samples: bool,
     #[serde(default)]
     pub delay_seconds: u64,
+    #[serde(default)]
+    pub display_mode_note: Option<String>,
+    #[serde(default)]
+    pub map_note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -332,8 +336,18 @@ pub struct CaptureAttempt {
     pub saved_path: Option<String>,
     pub image_hash: Option<String>,
     pub black_screen_suspected: Option<bool>,
+    pub stale_frame_suspected: Option<bool>,
+    pub matched_previous_report: Option<String>,
+    pub matched_previous_strategy: Option<String>,
     pub metrics: Option<PixelMetrics>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct HistoricalCaptureAttempt {
+    report: String,
+    strategy: String,
+    image_hash: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -412,7 +426,9 @@ fn run_capture_diagnostic(
 
     let environment = environment_snapshot(&base_dir);
     let targets = platform::list_capture_targets();
-    let attempts = platform::run_capture_diagnostic(&request, &report_dir);
+    let history = collect_historical_capture_attempts(&base_dir.join("diagnostics"), &id);
+    let mut attempts = platform::run_capture_diagnostic(&request, &report_dir);
+    mark_stale_frame_attempts(&mut attempts, &history);
     let summary = summarize_attempts(&attempts);
 
     let mut report = DiagnosticReport {
@@ -1896,19 +1912,123 @@ fn environment_snapshot(app_data_dir: &Path) -> EnvironmentSnapshot {
     }
 }
 
+fn clean_note(note: Option<&String>) -> &str {
+    note.map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("未填写")
+}
+
+fn collect_historical_capture_attempts(
+    diagnostics_dir: &Path,
+    current_report_id: &str,
+) -> Vec<HistoricalCaptureAttempt> {
+    let mut report_paths = match fs::read_dir(diagnostics_dir) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                let report_id = entry.file_name().to_string_lossy().to_string();
+                if report_id == current_report_id {
+                    return None;
+                }
+                let modified_at = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok();
+                Some((modified_at, report_id, path.join("diagnostic.json")))
+            })
+            .collect::<Vec<_>>(),
+        Err(_) => Vec::new(),
+    };
+
+    report_paths.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+
+    report_paths
+        .into_iter()
+        .take(50)
+        .filter_map(|(_, report_id, json_path)| {
+            let report_dir = json_path
+                .parent()
+                .map(|path| path.display().to_string())
+                .unwrap_or(report_id);
+            let content = fs::read_to_string(json_path).ok()?;
+            let value = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+            let attempts = value.get("attempts")?.as_array()?;
+            Some(
+                attempts
+                    .iter()
+                    .filter_map(move |attempt| {
+                        let status = attempt.get("status")?.as_str()?;
+                        if status != "success" {
+                            return None;
+                        }
+                        let image_hash = attempt.get("imageHash")?.as_str()?.to_string();
+                        let strategy = attempt
+                            .get("strategy")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        Some(HistoricalCaptureAttempt {
+                            report: report_dir.clone(),
+                            strategy,
+                            image_hash,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect()
+}
+
+fn mark_stale_frame_attempts(
+    attempts: &mut [CaptureAttempt],
+    history: &[HistoricalCaptureAttempt],
+) {
+    for attempt in attempts.iter_mut() {
+        if attempt.status != "success" {
+            continue;
+        }
+        let Some(image_hash) = attempt.image_hash.as_deref() else {
+            continue;
+        };
+        if let Some(previous) = history.iter().find(|item| item.image_hash == image_hash) {
+            attempt.stale_frame_suspected = Some(true);
+            attempt.matched_previous_report = Some(previous.report.clone());
+            attempt.matched_previous_strategy = Some(previous.strategy.clone());
+        } else {
+            attempt.stale_frame_suspected = Some(false);
+        }
+    }
+}
+
 fn summarize_attempts(attempts: &[CaptureAttempt]) -> String {
     if attempts.iter().any(|attempt| attempt.status == "success") {
         let black_count = attempts
             .iter()
             .filter(|attempt| attempt.black_screen_suspected == Some(true))
             .count();
-        if black_count > 0 {
+        let stale_count = attempts
+            .iter()
+            .filter(|attempt| attempt.stale_frame_suspected == Some(true))
+            .count();
+        if black_count > 0 || stale_count > 0 {
+            let mut warnings = Vec::new();
+            if black_count > 0 {
+                warnings.push(format!("{} 个结果疑似黑屏", black_count));
+            }
+            if stale_count > 0 {
+                warnings.push(format!("{} 个结果疑似旧帧", stale_count));
+            }
             format!(
-                "有截图策略成功，但 {} 个结果疑似黑屏，请优先查看样本图。",
-                black_count
+                "有截图策略成功，但{}，请优先查看样本图和历史匹配记录。",
+                warnings.join("，")
             )
         } else {
-            "至少一个截图策略成功，未发现明显黑屏。".to_string()
+            "至少一个截图策略成功，未发现明显黑屏或旧帧哈希重复。".to_string()
         }
     } else {
         "所有截图策略均失败或在当前平台不可用。".to_string()
@@ -1921,6 +2041,14 @@ fn render_log(report: &DiagnosticReport) -> String {
     lines.push(format!("生成时间: {}", report.created_at));
     lines.push(format!("保存样本: {}", report.request.save_samples));
     lines.push(format!("延迟截图: {} 秒", report.request.delay_seconds));
+    lines.push(format!(
+        "显示模式备注: {}",
+        clean_note(report.request.display_mode_note.as_ref())
+    ));
+    lines.push(format!(
+        "地图备注: {}",
+        clean_note(report.request.map_note.as_ref())
+    ));
     lines.push(String::new());
     lines.push("[环境]".to_string());
     lines.push(format!("OS: {}", report.environment.os));
@@ -1946,9 +2074,19 @@ fn render_log(report: &DiagnosticReport) -> String {
             attempt.strategy, attempt.target_label, attempt.status, attempt.duration_ms
         ));
         lines.push(format!(
-            "    size={:?}x{:?} black={:?} hash={:?}",
-            attempt.width, attempt.height, attempt.black_screen_suspected, attempt.image_hash
+            "    size={:?}x{:?} black={:?} stale={:?} hash={:?}",
+            attempt.width,
+            attempt.height,
+            attempt.black_screen_suspected,
+            attempt.stale_frame_suspected,
+            attempt.image_hash
         ));
+        if attempt.stale_frame_suspected == Some(true) {
+            lines.push(format!(
+                "    matched_previous_report={:?} matched_previous_strategy={:?}",
+                attempt.matched_previous_report, attempt.matched_previous_strategy
+            ));
+        }
         if let Some(metrics) = &attempt.metrics {
             lines.push(format!(
                 "    metrics average_luma={:.2} variance={:.2} near_black_ratio={:.4} sampled_pixels={}",
@@ -2084,6 +2222,9 @@ where
                 saved_path: image.saved_path.map(|path| path.display().to_string()),
                 image_hash: Some(hash_bytes(&image.rgba)),
                 black_screen_suspected: Some(black_screen_suspected),
+                stale_frame_suspected: None,
+                matched_previous_report: None,
+                matched_previous_strategy: None,
                 metrics: Some(metrics),
                 error: None,
             }
@@ -2099,6 +2240,9 @@ where
             saved_path: None,
             image_hash: None,
             black_screen_suspected: None,
+            stale_frame_suspected: None,
+            matched_previous_report: None,
+            matched_previous_strategy: None,
             metrics: None,
             error: Some(error),
         },
@@ -2122,6 +2266,9 @@ fn failed_attempt(
         saved_path: None,
         image_hash: None,
         black_screen_suspected: None,
+        stale_frame_suspected: None,
+        matched_previous_report: None,
+        matched_previous_strategy: None,
         metrics: None,
         error: Some(message.into()),
     }
