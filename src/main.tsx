@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createRoot } from "react-dom/client";
+import Tesseract from "tesseract.js";
 import "./styles.css";
 
 type RectInfo = {
@@ -163,7 +164,7 @@ type OverlayStoredState = {
   cards: OverlayPocCardInfo[];
 };
 
-type Mode = "diagnostic" | "calibration" | "overlay";
+type Mode = "diagnostic" | "calibration" | "overlay" | "ocr";
 type RegionKey =
   | "name-1"
   | "name-2"
@@ -189,6 +190,18 @@ type DragSelection = {
   startY: number;
   currentX: number;
   currentY: number;
+};
+
+type OcrSlotStatus = "pending" | "recognized" | "suspect" | "manual" | "failed";
+
+type OcrSlotResult = {
+  slot: number;
+  rawText: string;
+  confidence: number;
+  matchedName: string;
+  matchScore: number;
+  status: OcrSlotStatus;
+  message?: string;
 };
 
 const REGION_DEFINITIONS: RegionDefinition[] = [
@@ -218,6 +231,37 @@ const DEFAULT_OVERLAY = {
 };
 
 const OVERLAY_STORAGE_KEY = "hex-assistant.overlayPoc";
+const OCR_CONFIDENCE_THRESHOLD = 65;
+const OCR_MATCH_THRESHOLD = 0.72;
+const OCR_WORKER_PATH = "/ocr-assets/tesseract/worker.min.js";
+const OCR_CORE_PATH = "/ocr-assets/tesseract-core";
+const OCR_LANG_PATH = "/ocr-assets/lang";
+const HEX_NAME_LIBRARY = [
+  "吞噬灵魂",
+  "巨像勇气",
+  "双刀流",
+  "量子计算",
+  "潘朵拉的装备",
+  "珠光莲花",
+  "升级咯",
+  "纷乱头脑",
+  "清晰头脑",
+  "开摆",
+  "利滚利",
+  "明智消费",
+  "源计划植入",
+  "源计划上行链路",
+  "药剂师",
+  "治疗法球",
+  "了解你的敌人",
+  "小巨人",
+  "大百宝袋",
+  "后期专家",
+  "便携锻炉",
+  "诅咒冠冕",
+  "黄金门票",
+  "快速思考",
+];
 
 function App() {
   const [mode, setMode] = useState<Mode>("diagnostic");
@@ -247,6 +291,12 @@ function App() {
     useState<OverlayPocClickThroughResult | null>(null);
   const [overlayLoading, setOverlayLoading] = useState(false);
   const [overlayError, setOverlayError] = useState<string | null>(null);
+  const [ocrResults, setOcrResults] = useState<OcrSlotResult[]>([]);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrError, setOcrError] = useState<string | null>(null);
+  const [ocrMessage, setOcrMessage] = useState<string | null>(null);
+  const [ocrProgress, setOcrProgress] = useState<string | null>(null);
+  const [ocrChangedSlots, setOcrChangedSlots] = useState<number[]>([]);
 
   useEffect(() => {
     void refresh();
@@ -261,6 +311,7 @@ function App() {
     () => monitorTargets.find((target) => target.id === selectedMonitorId) ?? monitorTargets[0],
     [monitorTargets, selectedMonitorId],
   );
+  const canRunOcr = Boolean(calibrationProfile && calibrationSnapshot?.samplePath);
 
   async function refresh() {
     setError(null);
@@ -440,6 +491,104 @@ function App() {
     }
   }
 
+  async function runOcrPoc() {
+    if (!calibrationProfile) {
+      setOcrError("请先到校准页保存校准配置。");
+      return;
+    }
+    if (!calibrationSnapshot?.samplePath) {
+      setOcrError("请先到校准页获取一张校准截图，再运行 OCR POC。");
+      return;
+    }
+    if (calibrationProfile.nameRegions.length < 3) {
+      setOcrError("校准配置缺少三块名称区域，请回到校准页补齐 nameRegions。");
+      return;
+    }
+
+    setOcrLoading(true);
+    setOcrError(null);
+    setOcrMessage(null);
+    setOcrProgress("准备 OCR worker...");
+    setOcrChangedSlots([]);
+
+    const previousNames = new Map(ocrResults.map((result) => [result.slot, result.matchedName]));
+    let worker: Tesseract.Worker | null = null;
+
+    try {
+      const image = await loadImageElement(convertFileSrc(calibrationSnapshot.samplePath));
+      worker = await Tesseract.createWorker("chi_sim", Tesseract.OEM.LSTM_ONLY, {
+        workerPath: OCR_WORKER_PATH,
+        corePath: OCR_CORE_PATH,
+        langPath: OCR_LANG_PATH,
+        cacheMethod: "none",
+        logger: (message) => {
+          const percent = Math.round((message.progress ?? 0) * 100);
+          setOcrProgress(`${message.status} ${Number.isFinite(percent) ? `${percent}%` : ""}`.trim());
+        },
+      });
+      await worker.setParameters({
+        tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE,
+        preserve_interword_spaces: "1",
+      });
+
+      const nextResults: OcrSlotResult[] = [];
+      const nameRegions = calibrationProfile.nameRegions.slice().sort((left, right) => left.slot - right.slot);
+      for (const region of nameRegions) {
+        setOcrProgress(`识别 slot ${region.slot}...`);
+        const cropCanvas = cropRegionToCanvas(image, region);
+        const result = await worker.recognize(cropCanvas);
+        nextResults.push(buildOcrResult(region.slot, result.data.text, result.data.confidence));
+      }
+
+      const changedSlots = nextResults
+        .filter((result) => {
+          const previous = previousNames.get(result.slot);
+          return previous !== undefined && previous !== result.matchedName;
+        })
+        .map((result) => result.slot);
+
+      setOcrResults(nextResults);
+      setOcrChangedSlots(changedSlots);
+      if (changedSlots.length === 1) {
+        setOcrMessage(`slot ${changedSlots[0]} 标准名称变化，只刷新对应 slot。`);
+      } else if (changedSlots.length > 1) {
+        setOcrMessage(`检测到 ${changedSlots.length} 个 slot 标准名称变化。`);
+      } else {
+        setOcrMessage("OCR 完成，标准名称未发生变化。");
+      }
+    } catch (err) {
+      setOcrError(String(err));
+    } finally {
+      if (worker) {
+        await worker.terminate();
+      }
+      setOcrLoading(false);
+      setOcrProgress(null);
+    }
+  }
+
+  function applyManualOcrCorrection(slot: number, value: string) {
+    const nextName = value.trim();
+    if (!nextName) {
+      return;
+    }
+    setOcrResults((current) =>
+      current.map((result) =>
+        result.slot === slot
+          ? {
+              ...result,
+              matchedName: nextName,
+              matchScore: HEX_NAME_LIBRARY.includes(nextName) ? 1 : result.matchScore,
+              status: "manual",
+              message: "人工修正",
+            }
+          : result,
+      ),
+    );
+    setOcrChangedSlots((current) => current.filter((changedSlot) => changedSlot !== slot));
+    setOcrMessage(`slot ${slot} 已人工修正为 ${nextName}。`);
+  }
+
   return (
     <main className="app-shell">
       <section className="top-bar">
@@ -470,11 +619,18 @@ function App() {
             >
               Overlay POC
             </button>
+            <button
+              className={mode === "ocr" ? "selected" : ""}
+              onClick={() => setMode("ocr")}
+              type="button"
+            >
+              OCR POC
+            </button>
           </div>
           <button
             className="ghost-button"
             onClick={refresh}
-            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading}
+            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading || ocrLoading}
             type="button"
           >
             刷新环境
@@ -503,6 +659,14 @@ function App() {
               onOpen={openOverlayPoc}
               onClose={closeOverlayPoc}
               onSetClickThrough={setOverlayClickThrough}
+            />
+          ) : mode === "ocr" ? (
+            <OcrControls
+              loading={ocrLoading}
+              canRun={canRunOcr}
+              hasCalibrationProfile={Boolean(calibrationProfile)}
+              hasCalibrationSnapshot={Boolean(calibrationSnapshot?.samplePath)}
+              onRun={runOcrPoc}
             />
           ) : (
             <CalibrationControls
@@ -541,6 +705,18 @@ function App() {
               clickThroughResult={overlayClickThroughResult}
               error={overlayError}
               hasCalibrationProfile={Boolean(calibrationProfile)}
+            />
+          ) : mode === "ocr" ? (
+            <OcrWorkspace
+              profile={calibrationProfile}
+              snapshot={calibrationSnapshot}
+              results={ocrResults}
+              loading={ocrLoading}
+              error={ocrError}
+              message={ocrMessage}
+              progress={ocrProgress}
+              changedSlots={ocrChangedSlots}
+              onManualCorrect={applyManualOcrCorrection}
             />
           ) : (
             <CalibrationWorkspace
@@ -770,6 +946,48 @@ function OverlayControls({
   );
 }
 
+function OcrControls({
+  loading,
+  canRun,
+  hasCalibrationProfile,
+  hasCalibrationSnapshot,
+  onRun,
+}: {
+  loading: boolean;
+  canRun: boolean;
+  hasCalibrationProfile: boolean;
+  hasCalibrationSnapshot: boolean;
+  onRun: () => void;
+}) {
+  return (
+    <>
+      <h2>OCR POC</h2>
+      <div className="target-option selected static-target">
+        <span>
+          <strong>三块名称区域识别</strong>
+          <small>只裁剪已保存校准配置里的 nameRegions，不做全屏 OCR、不接 ApexLOL、不接 Overlay 数据。</small>
+        </span>
+      </div>
+
+      <div className={canRun ? "success-strip" : "overlay-status-strip"}>
+        {canRun
+          ? "已具备校准配置和当前校准截图，可以手动运行 OCR。"
+          : hasCalibrationProfile
+            ? "已有校准配置，但没有当前校准截图；请先到校准页获取截图。"
+            : hasCalibrationSnapshot
+              ? "已有当前校准截图，但还没有保存校准配置。"
+              : "请先到校准页获取截图并保存校准配置。"}
+      </div>
+
+      <div className="button-stack">
+        <button className="primary-button" onClick={onRun} disabled={loading || !canRun} type="button">
+          {loading ? "OCR 识别中..." : "运行三槽 OCR"}
+        </button>
+      </div>
+    </>
+  );
+}
+
 function SharedCaptureOptions({
   saveSamples,
   delaySeconds,
@@ -940,6 +1158,139 @@ function OverlayWorkspace({
           <p>点击左侧按钮后，主窗口会展示后端返回的窗口信息、点击穿透结果和三张测试卡片坐标。</p>
         </section>
       )}
+    </section>
+  );
+}
+
+function OcrWorkspace({
+  profile,
+  snapshot,
+  results,
+  loading,
+  error,
+  message,
+  progress,
+  changedSlots,
+  onManualCorrect,
+}: {
+  profile: CalibrationProfile | null;
+  snapshot: CalibrationSnapshotResult | null;
+  results: OcrSlotResult[];
+  loading: boolean;
+  error: string | null;
+  message: string | null;
+  progress: string | null;
+  changedSlots: number[];
+  onManualCorrect: (slot: number, value: string) => void;
+}) {
+  const sortedResults = results.slice().sort((left, right) => left.slot - right.slot);
+
+  return (
+    <section className="report-panel ocr-workspace">
+      <div className="report-header">
+        <div>
+          <h2>OCR 与词库纠错 POC</h2>
+          <p>基于当前校准截图裁剪三块 nameRegions，识别后用本地海克斯词库输出标准名称。</p>
+        </div>
+        <span className="report-id">Stage 2C</span>
+      </div>
+
+      {error ? <div className="error-strip">{error}</div> : null}
+      {message ? <div className="success-strip">{message}</div> : null}
+      {progress ? <div className="overlay-status-strip">{progress}</div> : null}
+
+      <div className="ocr-source-grid">
+        <div className="info-panel">
+          <h2>校准配置</h2>
+          {profile ? (
+            <dl>
+              <dt>名称</dt>
+              <dd>{profile.profileName}</dd>
+              <dt>显示器</dt>
+              <dd>{profile.monitorName}</dd>
+              <dt>区域</dt>
+              <dd>{profile.nameRegions.length} 个 nameRegions</dd>
+            </dl>
+          ) : (
+            <p className="muted">尚未读取到校准配置。</p>
+          )}
+        </div>
+
+        <div className="info-panel">
+          <h2>校准截图</h2>
+          {snapshot?.samplePath ? (
+            <dl>
+              <dt>尺寸</dt>
+              <dd>
+                {snapshot.width} × {snapshot.height}
+              </dd>
+              <dt>样本</dt>
+              <dd>{snapshot.samplePath}</dd>
+            </dl>
+          ) : (
+            <p className="muted">没有当前截图，请先到校准页获取截图。</p>
+          )}
+        </div>
+      </div>
+
+      {sortedResults.length > 0 ? (
+        <div className="ocr-result-list">
+          {sortedResults.map((result) => (
+            <article
+              key={result.slot}
+              className={`ocr-result-card ${changedSlots.includes(result.slot) ? "changed" : ""}`}
+            >
+              <header>
+                <strong>slot {result.slot}</strong>
+                <span className={`badge ${result.status}`}>
+                  {result.status === "suspect" ? "疑似结果" : formatOcrStatus(result.status)}
+                </span>
+              </header>
+              <dl>
+                <dt>原始文本</dt>
+                <dd>{result.rawText || "未识别到文本"}</dd>
+                <dt>置信度</dt>
+                <dd>{formatScore(result.confidence)}</dd>
+                <dt>标准名称</dt>
+                <dd>{result.matchedName || "未匹配"}</dd>
+                <dt>匹配分</dt>
+                <dd>{formatScore(result.matchScore * 100)}</dd>
+                <dt>状态</dt>
+                <dd>{result.message ?? formatOcrStatus(result.status)}</dd>
+              </dl>
+              {changedSlots.includes(result.slot) ? (
+                <p className="slot-refresh-note">只刷新对应 slot</p>
+              ) : null}
+              <label className="manual-correction-field">
+                人工修正
+                <input
+                  key={`${result.slot}-${result.matchedName}-${result.status}`}
+                  list="hex-name-library"
+                  defaultValue={result.matchedName}
+                  onBlur={(event) => onManualCorrect(result.slot, event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      onManualCorrect(result.slot, event.currentTarget.value);
+                    }
+                  }}
+                  disabled={loading}
+                />
+              </label>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <section className="empty-state">
+          <h2>等待 OCR</h2>
+          <p>点击左侧按钮后，系统会逐个裁剪 slot1/2/3 的名称区域并识别。低置信度或低匹配分会标记为疑似结果。</p>
+        </section>
+      )}
+
+      <datalist id="hex-name-library">
+        {HEX_NAME_LIBRARY.map((name) => (
+          <option key={name} value={name} />
+        ))}
+      </datalist>
     </section>
   );
 }
@@ -1321,6 +1672,119 @@ function OverlayPocPage() {
   );
 }
 
+function buildOcrResult(slot: number, rawText: string, confidence: number): OcrSlotResult {
+  const cleanRawText = rawText.replace(/\s+/g, " ").trim();
+  const match = matchHexName(cleanRawText);
+  const status =
+    confidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
+
+  return {
+    slot,
+    rawText: cleanRawText,
+    confidence: Math.max(0, confidence || 0),
+    matchedName: match.name,
+    matchScore: match.score,
+    status,
+    message:
+      status === "suspect"
+        ? "疑似结果，需要人工确认或修正"
+        : "已通过词库匹配",
+  };
+}
+
+function matchHexName(rawText: string) {
+  const normalizedRawText = normalizeOcrText(rawText);
+  if (!normalizedRawText) {
+    return { name: "", score: 0 };
+  }
+
+  return HEX_NAME_LIBRARY.map((name) => {
+    const normalizedName = normalizeOcrText(name);
+    const distanceScore = similarityScore(normalizedRawText, normalizedName);
+    const containsScore =
+      normalizedRawText.includes(normalizedName) || normalizedName.includes(normalizedRawText) ? 0.94 : 0;
+    return {
+      name,
+      score: Math.max(distanceScore, containsScore),
+    };
+  }).reduce((best, current) => (current.score > best.score ? current : best), {
+    name: "",
+    score: 0,
+  });
+}
+
+function normalizeOcrText(value: string) {
+  return value
+    .replace(/[^\p{Script=Han}a-zA-Z0-9]/gu, "")
+    .replace(/[〇○]/g, "零")
+    .trim()
+    .toLowerCase();
+}
+
+function similarityScore(left: string, right: string) {
+  if (!left || !right) {
+    return 0;
+  }
+  if (left === right) {
+    return 1;
+  }
+
+  const leftChars = Array.from(left);
+  const rightChars = Array.from(right);
+  const distance = levenshteinDistance(leftChars, rightChars);
+  return Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length));
+}
+
+function levenshteinDistance(left: string[], right: string[]) {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = new Array<number>(right.length + 1);
+
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    current[0] = leftIndex;
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+      current[rightIndex] = Math.min(
+        previous[rightIndex] + 1,
+        current[rightIndex - 1] + 1,
+        previous[rightIndex - 1] + substitutionCost,
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+
+  return previous[right.length];
+}
+
+function loadImageElement(src: string) {
+  return new Promise<HTMLImageElement>((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => resolve(image);
+    image.onerror = () => reject(new Error("无法读取当前校准截图。"));
+    image.src = src;
+  });
+}
+
+function cropRegionToCanvas(image: HTMLImageElement, region: SlottedRatioRegion) {
+  const naturalWidth = image.naturalWidth || image.width;
+  const naturalHeight = image.naturalHeight || image.height;
+  const sourceX = Math.round(region.xRatio * naturalWidth);
+  const sourceY = Math.round(region.yRatio * naturalHeight);
+  const sourceWidth = Math.max(1, Math.round(region.widthRatio * naturalWidth));
+  const sourceHeight = Math.max(1, Math.round(region.heightRatio * naturalHeight));
+  const scale = sourceWidth < 260 ? 2 : 1;
+  const canvas = document.createElement("canvas");
+  canvas.width = sourceWidth * scale;
+  canvas.height = sourceHeight * scale;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("当前环境无法创建 OCR 裁剪画布。");
+  }
+
+  context.imageSmoothingEnabled = false;
+  context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+  return canvas;
+}
+
 function pointFromPointer(event: React.PointerEvent<HTMLDivElement>) {
   const rect = event.currentTarget.getBoundingClientRect();
   return {
@@ -1392,6 +1856,26 @@ function formatRect(rect: RectInfo) {
 
 function formatBoolean(value: boolean) {
   return value ? "是" : "否";
+}
+
+function formatOcrStatus(status: OcrSlotStatus) {
+  if (status === "recognized") {
+    return "已匹配";
+  }
+  if (status === "manual") {
+    return "人工修正";
+  }
+  if (status === "failed") {
+    return "失败";
+  }
+  if (status === "pending") {
+    return "等待";
+  }
+  return "疑似结果";
+}
+
+function formatScore(value: number) {
+  return Number.isFinite(value) ? value.toFixed(1) : "0.0";
 }
 
 function rectToAbsoluteStyle(rect: RectInfo): React.CSSProperties {

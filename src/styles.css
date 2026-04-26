@@ -422,9 +422,20 @@ dd {
   gap: 16px;
 }
 
+.ocr-workspace {
+  display: grid;
+  gap: 16px;
+}
+
 .overlay-result-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.ocr-source-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
 }
 
@@ -437,6 +448,81 @@ dd {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 12px;
+}
+
+.ocr-result-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.ocr-result-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid #dde1d9;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.ocr-result-card.changed {
+  border-color: #c26b3f;
+  box-shadow: inset 4px 0 0 #c26b3f;
+}
+
+.ocr-result-card header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.badge.recognized {
+  color: #176240;
+  background: #e5f4eb;
+}
+
+.badge.suspect {
+  color: #8a5b10;
+  background: #fff1c6;
+}
+
+.badge.manual {
+  color: #234f79;
+  background: #e7f0fb;
+}
+
+.badge.pending,
+.badge.failed {
+  color: #8d2d2d;
+  background: #f8e8e6;
+}
+
+.slot-refresh-note {
+  padding: 8px 10px;
+  color: #8a4b22;
+  background: #fff0e7;
+  border: 1px solid #efc7ae;
+  border-radius: 7px;
+  font-size: 13px;
+}
+
+.manual-correction-field {
+  display: grid;
+  gap: 6px;
+  color: #475049;
+  font-weight: 700;
+}
+
+.manual-correction-field input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #20242b;
+  background: #ffffff;
+  border: 1px solid #cfd5cc;
+  border-radius: 7px;
+  font-weight: 400;
 }
 
 .calibration-panel,
@@ -650,6 +736,8 @@ dd {
   .workspace,
   .info-grid,
   .overlay-result-grid,
+  .ocr-source-grid,
+  .ocr-result-list,
   .overlay-card-list,
   .calibration-layout,
   .profile-region-grid {
