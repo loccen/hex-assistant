@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { createRoot } from "react-dom/client";
 import Tesseract from "tesseract.js";
 import "./styles.css";
@@ -92,11 +92,19 @@ type CalibrationMonitorInfo = {
 type CalibrationSnapshotResult = {
   createdAt: string;
   samplePath?: string | null;
+  sampleDataUrl?: string | null;
+  sampleBytes?: number | null;
   width: number;
   height: number;
   monitor: CalibrationMonitorInfo;
   metrics: PixelMetrics;
   blackScreenSuspected: boolean;
+};
+
+type CalibrationSnapshotDataUrl = {
+  path: string;
+  dataUrl: string;
+  bytes: number;
 };
 
 type RatioRegion = {
@@ -420,7 +428,7 @@ function App() {
     () => monitorTargets.find((target) => target.id === selectedMonitorId) ?? monitorTargets[0],
     [monitorTargets, selectedMonitorId],
   );
-  const canRunOcr = Boolean(calibrationProfile && calibrationSnapshot?.samplePath);
+  const canRunOcr = Boolean(calibrationProfile && calibrationSnapshot?.sampleDataUrl);
   const pendingMilestoneQueue = useMemo(
     () => buildPendingMilestoneQueue(liveClientPlayer, completedMilestones),
     [completedMilestones, liveClientPlayer],
@@ -966,7 +974,19 @@ function App() {
       const result = await invoke<CalibrationSnapshotResult>("capture_calibration_snapshot", {
         request,
       });
-      setCalibrationSnapshot(result);
+      let snapshot: CalibrationSnapshotResult = result;
+      if (result.samplePath) {
+        const sample = await invoke<CalibrationSnapshotDataUrl>("read_calibration_snapshot_data_url", {
+          path: result.samplePath,
+        });
+        snapshot = {
+          ...result,
+          samplePath: sample.path,
+          sampleDataUrl: sample.dataUrl,
+          sampleBytes: sample.bytes,
+        };
+      }
+      setCalibrationSnapshot(snapshot);
       setSelectedMonitorId(result.monitor.id);
       setCalibrationMessage("已获取校准截图，可以开始框选区域。");
       void appendTestEvent({
@@ -974,12 +994,13 @@ function App() {
         action: "captureSnapshot",
         message: "校准截图完成。",
         details: {
-          samplePath: result.samplePath,
-          width: result.width,
-          height: result.height,
-          monitor: result.monitor,
-          blackScreenSuspected: result.blackScreenSuspected,
-          metrics: result.metrics,
+          samplePath: snapshot.samplePath,
+          sampleBytes: snapshot.sampleBytes ?? null,
+          width: snapshot.width,
+          height: snapshot.height,
+          monitor: snapshot.monitor,
+          blackScreenSuspected: snapshot.blackScreenSuspected,
+          metrics: snapshot.metrics,
           request,
         },
       });
@@ -1210,13 +1231,13 @@ function App() {
       });
       return;
     }
-    if (!calibrationSnapshot?.samplePath) {
+    if (!calibrationSnapshot?.sampleDataUrl) {
       setOcrError("请先到校准页获取一张校准截图，再运行 OCR POC。");
       void appendTestEvent({
         stage: "ocr",
         action: "run",
         message: "OCR 未执行：缺少当前校准截图样本。",
-        details: { profileName: calibrationProfile.profileName },
+        details: { profileName: calibrationProfile.profileName, samplePath: calibrationSnapshot?.samplePath ?? null },
       });
       return;
     }
@@ -1244,7 +1265,7 @@ function App() {
     let worker: Tesseract.Worker | null = null;
 
     try {
-      const image = await loadImageElement(convertFileSrc(calibrationSnapshot.samplePath));
+      const image = await loadImageElement(calibrationSnapshot.sampleDataUrl);
       worker = await Tesseract.createWorker("chi_sim", Tesseract.OEM.LSTM_ONLY, {
         workerPath: OCR_WORKER_PATH,
         corePath: OCR_CORE_PATH,
@@ -1458,7 +1479,7 @@ function App() {
               loading={ocrLoading}
               canRun={canRunOcr}
               hasCalibrationProfile={Boolean(calibrationProfile)}
-              hasCalibrationSnapshot={Boolean(calibrationSnapshot?.samplePath)}
+              hasCalibrationSnapshot={Boolean(calibrationSnapshot?.sampleDataUrl)}
               onRun={runOcrPoc}
             />
           ) : mode === "stateMachine" ? (
@@ -1582,6 +1603,19 @@ function App() {
               onRegionChange={updateRegion}
               onClearAll={clearAllRegions}
               onReloadProfile={loadCalibrationProfile}
+              onPreviewLoadError={(snapshot) => {
+                void appendTestEvent({
+                  stage: "calibration",
+                  action: "previewSnapshot",
+                  message: "校准截图预览加载失败。",
+                  details: {
+                    samplePath: snapshot.samplePath ?? null,
+                    sampleBytes: snapshot.sampleBytes ?? null,
+                    width: snapshot.width,
+                    height: snapshot.height,
+                  },
+                });
+              }}
             />
           )}
         </section>
@@ -2780,6 +2814,7 @@ function CalibrationWorkspace({
   onRegionChange,
   onClearAll,
   onReloadProfile,
+  onPreviewLoadError,
 }: {
   snapshot: CalibrationSnapshotResult | null;
   profile: CalibrationProfile | null;
@@ -2791,12 +2826,13 @@ function CalibrationWorkspace({
   onRegionChange: (key: RegionKey, region: RatioRegion | null) => void;
   onClearAll: () => void;
   onReloadProfile: () => void;
+  onPreviewLoadError: (snapshot: CalibrationSnapshotResult) => void;
 }) {
   const [dragSelection, setDragSelection] = useState<DragSelection | null>(null);
   const [imageFailed, setImageFailed] = useState(false);
   const width = snapshot?.width ?? profile?.screenshotWidth ?? 1920;
   const height = snapshot?.height ?? profile?.screenshotHeight ?? 1080;
-  const imageSrc = snapshot?.samplePath ? convertFileSrc(snapshot.samplePath) : null;
+  const imageSrc = snapshot?.sampleDataUrl ?? null;
   const activeDefinition = REGION_DEFINITIONS.find((definition) => definition.key === activeRegionKey);
   const selectedCount = REGION_DEFINITIONS.filter((definition) => regions[definition.key]).length;
   const visibleRegions = dragSelection
@@ -2808,7 +2844,7 @@ function CalibrationWorkspace({
 
   useEffect(() => {
     setImageFailed(false);
-  }, [snapshot?.samplePath]);
+  }, [snapshot?.sampleDataUrl]);
 
   function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
     if (!snapshot && !profile) {
@@ -2906,7 +2942,12 @@ function CalibrationWorkspace({
                 alt="校准截图预览"
                 draggable={false}
                 onLoad={() => setImageFailed(false)}
-                onError={() => setImageFailed(true)}
+                onError={() => {
+                  setImageFailed(true);
+                  if (snapshot) {
+                    onPreviewLoadError(snapshot);
+                  }
+                }}
               />
             ) : (
               <div className="preview-placeholder">

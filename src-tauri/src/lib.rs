@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 #[cfg(windows)]
@@ -97,6 +98,14 @@ pub struct CalibrationSnapshotResult {
     pub monitor: CalibrationMonitorInfo,
     pub metrics: PixelMetrics,
     pub black_screen_suspected: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSnapshotDataUrl {
+    pub path: String,
+    pub data_url: String,
+    pub bytes: usize,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -454,6 +463,40 @@ fn capture_calibration_snapshot(
 }
 
 #[tauri::command]
+fn read_calibration_snapshot_data_url(
+    app: AppHandle,
+    path: String,
+) -> Result<CalibrationSnapshotDataUrl, String> {
+    let snapshots_dir = app_data_dir(&app)?.join("calibration").join("snapshots");
+    let snapshots_dir = snapshots_dir
+        .canonicalize()
+        .map_err(|_| "校准截图目录不存在。".to_string())?;
+    let snapshot_path = PathBuf::from(path);
+    let snapshot_path = snapshot_path
+        .canonicalize()
+        .map_err(|_| "校准截图样本不存在。".to_string())?;
+
+    if !snapshot_path.starts_with(&snapshots_dir) {
+        return Err("只能读取应用数据目录中的校准截图样本。".to_string());
+    }
+    let is_png = snapshot_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"));
+    if !is_png {
+        return Err("只能读取 PNG 格式的校准截图样本。".to_string());
+    }
+
+    let bytes = fs::read(&snapshot_path).map_err(|err| err.to_string())?;
+    let encoded = general_purpose::STANDARD.encode(&bytes);
+    Ok(CalibrationSnapshotDataUrl {
+        path: snapshot_path.display().to_string(),
+        data_url: format!("data:image/png;base64,{}", encoded),
+        bytes: bytes.len(),
+    })
+}
+
+#[tauri::command]
 fn save_calibration_profile(app: AppHandle, profile: CalibrationProfile) -> Result<(), String> {
     validate_calibration_profile(&profile)?;
 
@@ -688,6 +731,7 @@ pub fn run() {
             list_capture_targets,
             run_capture_diagnostic,
             capture_calibration_snapshot,
+            read_calibration_snapshot_data_url,
             save_calibration_profile,
             load_calibration_profile,
             open_overlay_poc,
