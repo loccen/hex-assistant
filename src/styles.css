@@ -432,6 +432,11 @@ dd {
   gap: 16px;
 }
 
+.apex-workspace {
+  display: grid;
+  gap: 16px;
+}
+
 .overlay-result-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -520,6 +525,18 @@ dd {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.apex-input-panel {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.9fr) minmax(0, 1.1fr);
+  gap: 14px;
+}
+
+.apex-result-list {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
 }
 
 .panel-title-row,
@@ -696,6 +713,93 @@ dd {
   border: 1px solid #cfd5cc;
   border-radius: 7px;
   font-weight: 400;
+}
+
+.apex-result-card {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  padding: 14px;
+  background: #ffffff;
+  border: 1px solid #dde1d9;
+  border-radius: 8px;
+}
+
+.apex-result-card.no-data {
+  border-color: #ead99b;
+  box-shadow: inset 4px 0 0 #d4ad43;
+}
+
+.apex-result-card.has-data {
+  border-color: #98c5ac;
+  box-shadow: inset 4px 0 0 #2f6f57;
+}
+
+.apex-result-card header,
+.apex-card-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.apex-result-card header div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.apex-result-card header span:not(.badge) {
+  overflow-wrap: anywhere;
+  color: #69707a;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.apex-field {
+  display: grid;
+  gap: 6px;
+  color: #475049;
+  font-weight: 700;
+}
+
+.apex-field input {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  color: #20242b;
+  background: #ffffff;
+  border: 1px solid #cfd5cc;
+  border-radius: 7px;
+  font-weight: 400;
+}
+
+.apex-rating-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  background: #f5f6f2;
+  border-radius: 7px;
+}
+
+.apex-rating-row span {
+  padding: 4px 8px;
+  color: #ffffff;
+  background: #2f6f57;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.apex-rating-row strong {
+  color: #475049;
+  font-size: 13px;
+}
+
+.apex-result-card a {
+  color: #256f9c;
 }
 
 .calibration-panel,
@@ -916,6 +1020,8 @@ dd {
   .state-machine-summary,
   .state-status-grid,
   .state-machine-grid,
+  .apex-input-panel,
+  .apex-result-list,
   .profile-region-grid {
     grid-template-columns: 1fr;
   }
