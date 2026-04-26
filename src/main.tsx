@@ -128,6 +128,11 @@ type OverlayPocCardInfo = {
   body: string;
   bounds: RectInfo;
   source: string;
+  rating?: string;
+  ratingLabel?: string;
+  status?: string;
+  sourceUrl?: string;
+  cacheHit?: boolean;
 };
 
 type OverlayPocResult = {
@@ -164,7 +169,7 @@ type OverlayStoredState = {
   cards: OverlayPocCardInfo[];
 };
 
-type Mode = "diagnostic" | "calibration" | "overlay" | "ocr" | "stateMachine";
+type Mode = "diagnostic" | "calibration" | "overlay" | "ocr" | "stateMachine" | "apex";
 type RegionKey =
   | "name-1"
   | "name-2"
@@ -212,6 +217,25 @@ type LiveClientActivePlayerResult = {
   checkedAt: string;
   durationMs: number;
   error?: string | null;
+};
+
+type ApexLolAugmentResult = {
+  championName: string;
+  augmentName: string;
+  rating: string;
+  summary: string;
+  tip: string;
+  source: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  cacheHit: boolean;
+  status: string;
+  error?: string | null;
+};
+
+type ApexLolSlotResult = ApexLolAugmentResult & {
+  slot: number;
+  queryKey: string;
 };
 
 type StateMachineStatus =
@@ -339,6 +363,16 @@ function App() {
   const [ocrChangedSlots, setOcrChangedSlots] = useState<number[]>([]);
   const [liveClientPlayer, setLiveClientPlayer] = useState<LiveClientActivePlayerResult | null>(null);
   const [liveClientLoading, setLiveClientLoading] = useState(false);
+  const [apexChampionName, setApexChampionName] = useState("");
+  const [apexSlots, setApexSlots] = useState<string[]>(["", "", ""]);
+  const [apexSlotResults, setApexSlotResults] = useState<(ApexLolSlotResult | null)[]>([
+    null,
+    null,
+    null,
+  ]);
+  const [apexLoadingSlots, setApexLoadingSlots] = useState<number[]>([]);
+  const [apexMessage, setApexMessage] = useState<string | null>(null);
+  const [apexError, setApexError] = useState<string | null>(null);
   const [completedMilestones, setCompletedMilestones] = useState<number[]>([]);
   const [visualInput, setVisualInput] = useState<VisualDetectionInput>({
     buttonVisible: false,
@@ -350,6 +384,7 @@ function App() {
   const stateMachineEventIdRef = useRef(1);
   const previousStateRef = useRef<StateMachineStatus | null>(null);
   const previousQueueSignatureRef = useRef<string | null>(null);
+  const apexAutoLiveClientLoadedRef = useRef(false);
 
   useEffect(() => {
     void refresh();
@@ -375,6 +410,35 @@ function App() {
   );
 
   const queueSignature = pendingMilestoneQueue.join(",");
+
+  useEffect(() => {
+    if (mode !== "apex" || apexAutoLiveClientLoadedRef.current || apexChampionName.trim()) {
+      return;
+    }
+    apexAutoLiveClientLoadedRef.current = true;
+    void refreshApexLiveClientActivePlayer();
+  }, [mode]);
+
+  useEffect(() => {
+    const championName = liveClientPlayer?.championName?.trim();
+    if (!apexChampionName.trim() && liveClientPlayer?.available && championName) {
+      setApexChampionName(championName);
+    }
+  }, [apexChampionName, liveClientPlayer]);
+
+  useEffect(() => {
+    if (ocrResults.length === 0) {
+      return;
+    }
+    setApexSlots((current) =>
+      current.map((value, index) => {
+        if (value.trim()) {
+          return value;
+        }
+        return ocrResults.find((result) => result.slot === index + 1)?.matchedName.trim() ?? value;
+      }),
+    );
+  }, [ocrResults]);
 
   useEffect(() => {
     if (previousStateRef.current && previousStateRef.current !== stateMachineStatus) {
@@ -478,6 +542,154 @@ function App() {
     } finally {
       setLiveClientLoading(false);
     }
+  }
+
+  async function refreshApexLiveClientActivePlayer() {
+    setLiveClientLoading(true);
+    setApexError(null);
+    try {
+      const result = await invoke<LiveClientActivePlayerResult>("get_live_client_active_player");
+      setLiveClientPlayer(result);
+      if (result.available && result.championName?.trim()) {
+        setApexChampionName(result.championName.trim());
+        setApexMessage(`已读取当前英雄：${result.championName.trim()}。`);
+      } else {
+        setApexMessage("未读取到当前英雄，可手动输入英雄名称。");
+      }
+    } catch (err) {
+      const message = String(err);
+      setLiveClientPlayer({
+        available: false,
+        championName: null,
+        level: null,
+        checkedAt: new Date().toISOString(),
+        durationMs: 0,
+        error: message,
+      });
+      setApexMessage("未读取到当前英雄，可手动输入英雄名称。");
+      setApexError(message);
+    } finally {
+      setLiveClientLoading(false);
+    }
+  }
+
+  function updateApexChampionName(value: string) {
+    setApexChampionName(value);
+    setApexMessage(null);
+  }
+
+  function updateApexSlot(slot: number, value: string) {
+    const normalizedValue = value.trim();
+    setApexSlots((current) => {
+      const next = [...current];
+      next[slot - 1] = value;
+      return next;
+    });
+    setApexSlotResults((current) => {
+      const currentResult = current[slot - 1];
+      if (!currentResult || currentResult.queryKey === apexQueryKey(apexChampionName, normalizedValue)) {
+        return current;
+      }
+      const next = [...current];
+      next[slot - 1] = null;
+      return next;
+    });
+    setApexMessage(null);
+  }
+
+  function applyOcrResultsToApex() {
+    const sortedResults = ocrResults.slice().sort((left, right) => left.slot - right.slot);
+    if (sortedResults.length === 0) {
+      setApexMessage("当前没有 Stage 2C OCR 结果，请手动输入三 slot 海克斯名称。");
+      return;
+    }
+
+    setApexSlots((current) =>
+      [1, 2, 3].map((slot) => sortedResults.find((result) => result.slot === slot)?.matchedName.trim() ?? current[slot - 1] ?? ""),
+    );
+    setApexSlotResults((current) => {
+      const nextSlots = [1, 2, 3].map(
+        (slot) => sortedResults.find((result) => result.slot === slot)?.matchedName.trim() ?? apexSlots[slot - 1] ?? "",
+      );
+      return current.map((result, index) =>
+        result && result.queryKey === apexQueryKey(apexChampionName, nextSlots[index] ?? "") ? result : null,
+      );
+    });
+    setApexMessage("已读取 Stage 2C 当前 OCR 标准名称；普通查询只会刷新变化 slot。");
+  }
+
+  async function queryAllApexSlots(forceRefresh: boolean) {
+    setApexError(null);
+    const championName = apexChampionName.trim();
+    let requestedCount = 0;
+    let skippedCount = 0;
+
+    for (const slot of [1, 2, 3]) {
+      const augmentName = apexSlots[slot - 1]?.trim() ?? "";
+      const queryKey = apexQueryKey(championName, augmentName);
+      const currentResult = apexSlotResults[slot - 1];
+      if (!forceRefresh && currentResult?.queryKey === queryKey) {
+        skippedCount += 1;
+        continue;
+      }
+      requestedCount += 1;
+      await queryApexSlot(slot, forceRefresh);
+    }
+
+    if (requestedCount === 0) {
+      setApexMessage("三张结果均为当前输入，无需重复查询。");
+    } else if (!forceRefresh && skippedCount > 0) {
+      setApexMessage(`已刷新 ${requestedCount} 个变化 slot，跳过 ${skippedCount} 个未变化 slot。`);
+    } else {
+      setApexMessage(forceRefresh ? "已强制刷新三张结果。" : "已查询三张结果。");
+    }
+  }
+
+  async function queryApexSlot(slot: number, forceRefresh: boolean) {
+    const championName = apexChampionName.trim();
+    const augmentName = apexSlots[slot - 1]?.trim() ?? "";
+    const queryKey = apexQueryKey(championName, augmentName);
+
+    if (!championName || !augmentName) {
+      updateApexSlotResult(buildApexNoDataResult(slot, championName, augmentName, queryKey));
+      return;
+    }
+
+    setApexLoadingSlots((current) => (current.includes(slot) ? current : [...current, slot]));
+    setApexError(null);
+    try {
+      const result = await invoke<ApexLolAugmentResult>("resolve_apex_lol_augment", {
+        request: {
+          championName,
+          augmentName,
+          forceRefresh,
+        },
+      });
+      updateApexSlotResult({
+        ...result,
+        slot,
+        queryKey,
+      });
+    } catch (err) {
+      const message = String(err);
+      updateApexSlotResult({
+        ...buildApexNoDataResult(slot, championName, augmentName, queryKey),
+        status: "failed",
+        error: message,
+      });
+      setApexError(message);
+    } finally {
+      setApexLoadingSlots((current) => current.filter((loadingSlot) => loadingSlot !== slot));
+    }
+  }
+
+  function updateApexSlotResult(result: ApexLolSlotResult) {
+    setApexSlotResults((current) => {
+      const next = [...current];
+      next[result.slot - 1] = result;
+      writeApexOverlayState(next);
+      return next;
+    });
   }
 
   function updateVisualInput(patch: Partial<VisualDetectionInput>) {
@@ -820,11 +1032,26 @@ function App() {
             >
               状态机 POC
             </button>
+            <button
+              className={mode === "apex" ? "selected" : ""}
+              onClick={() => setMode("apex")}
+              type="button"
+            >
+              ApexLOL POC
+            </button>
           </div>
           <button
             className="ghost-button"
             onClick={refresh}
-            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading || ocrLoading || liveClientLoading}
+            disabled={
+              loading ||
+              calibrationLoading ||
+              calibrationSaving ||
+              overlayLoading ||
+              ocrLoading ||
+              liveClientLoading ||
+              apexLoadingSlots.length > 0
+            }
             type="button"
           >
             刷新环境
@@ -868,6 +1095,15 @@ function App() {
               canComplete={Boolean(pendingMilestoneQueue[0]) && !visualInput.buttonVisible}
               onRefresh={refreshLiveClientActivePlayer}
               onComplete={completeCurrentMilestone}
+            />
+          ) : mode === "apex" ? (
+            <ApexLolControls
+              loading={apexLoadingSlots.length > 0}
+              liveClientLoading={liveClientLoading}
+              onRefreshHero={refreshApexLiveClientActivePlayer}
+              onApplyOcrResults={applyOcrResultsToApex}
+              onQueryAll={() => void queryAllApexSlots(false)}
+              onForceRefresh={() => void queryAllApexSlots(true)}
             />
           ) : (
             <CalibrationControls
@@ -937,6 +1173,23 @@ function App() {
               onApplyOcrResults={applyOcrResultsToStateMachine}
               onClearChangedSlots={clearStateMachineChangedSlots}
               onCompleteCurrentMilestone={completeCurrentMilestone}
+            />
+          ) : mode === "apex" ? (
+            <ApexLolWorkspace
+              championName={apexChampionName}
+              slots={apexSlots}
+              results={apexSlotResults}
+              loadingSlots={apexLoadingSlots}
+              liveClientPlayer={liveClientPlayer}
+              liveClientLoading={liveClientLoading}
+              message={apexMessage}
+              error={apexError}
+              ocrResults={ocrResults}
+              onChampionNameChange={updateApexChampionName}
+              onSlotChange={updateApexSlot}
+              onQuerySlot={(slot, forceRefresh) => void queryApexSlot(slot, forceRefresh)}
+              onRefreshHero={refreshApexLiveClientActivePlayer}
+              onApplyOcrResults={applyOcrResultsToApex}
             />
           ) : (
             <CalibrationWorkspace
@@ -1241,6 +1494,53 @@ function StateMachineControls({
         </button>
         <button className="secondary-button" onClick={onComplete} disabled={loading || !canComplete} type="button">
           标记当前轮完成
+        </button>
+      </div>
+    </>
+  );
+}
+
+function ApexLolControls({
+  loading,
+  liveClientLoading,
+  onRefreshHero,
+  onApplyOcrResults,
+  onQueryAll,
+  onForceRefresh,
+}: {
+  loading: boolean;
+  liveClientLoading: boolean;
+  onRefreshHero: () => void;
+  onApplyOcrResults: () => void;
+  onQueryAll: () => void;
+  onForceRefresh: () => void;
+}) {
+  return (
+    <>
+      <h2>ApexLOL POC</h2>
+      <div className="target-option selected static-target">
+        <span>
+          <strong>三张海克斯查询</strong>
+          <small>按当前英雄和三 slot 标准名称逐张查询 ApexLOL，只展示建议内容，不做自动点击或自动选择。</small>
+        </span>
+      </div>
+
+      <div className="overlay-note">
+        普通查询会跳过未变化的 slot；强制刷新会对有输入的 slot 重新请求并绕过缓存。
+      </div>
+
+      <div className="button-stack">
+        <button className="secondary-button" onClick={onRefreshHero} disabled={loading || liveClientLoading} type="button">
+          {liveClientLoading ? "读取中..." : "刷新当前英雄"}
+        </button>
+        <button className="secondary-button" onClick={onApplyOcrResults} disabled={loading} type="button">
+          读取 OCR 三 slot
+        </button>
+        <button className="primary-button" onClick={onQueryAll} disabled={loading || liveClientLoading} type="button">
+          {loading ? "查询中..." : "查询三张"}
+        </button>
+        <button className="secondary-button" onClick={onForceRefresh} disabled={loading || liveClientLoading} type="button">
+          强制刷新
         </button>
       </div>
     </>
@@ -1782,6 +2082,224 @@ function StateMachineWorkspace({
   );
 }
 
+function ApexLolWorkspace({
+  championName,
+  slots,
+  results,
+  loadingSlots,
+  liveClientPlayer,
+  liveClientLoading,
+  message,
+  error,
+  ocrResults,
+  onChampionNameChange,
+  onSlotChange,
+  onQuerySlot,
+  onRefreshHero,
+  onApplyOcrResults,
+}: {
+  championName: string;
+  slots: string[];
+  results: (ApexLolSlotResult | null)[];
+  loadingSlots: number[];
+  liveClientPlayer: LiveClientActivePlayerResult | null;
+  liveClientLoading: boolean;
+  message: string | null;
+  error: string | null;
+  ocrResults: OcrSlotResult[];
+  onChampionNameChange: (value: string) => void;
+  onSlotChange: (slot: number, value: string) => void;
+  onQuerySlot: (slot: number, forceRefresh: boolean) => void;
+  onRefreshHero: () => void;
+  onApplyOcrResults: () => void;
+}) {
+  const hasOcrResults = ocrResults.length > 0;
+
+  return (
+    <section className="report-panel apex-workspace">
+      <div className="report-header">
+        <div>
+          <h2>Stage 2E ApexLOL 查询与展示 POC</h2>
+          <p>根据当前英雄和三张海克斯名称查询 ApexLOL 后端命令，并同步 Overlay POC 测试卡片文案。</p>
+        </div>
+        <span className="report-id">Stage 2E</span>
+      </div>
+
+      <div className="overlay-note strong">
+        这是展示 POC。页面不会自动点击、自动选择，也不新增 Hook、内存读取或进程扫描。
+      </div>
+
+      {error ? <div className="error-strip">{error}</div> : null}
+      {message ? <div className="success-strip">{message}</div> : null}
+
+      <section className="apex-input-panel">
+        <div className="info-panel">
+          <div className="panel-title-row">
+            <h2>英雄</h2>
+            <button className="ghost-button compact-button" onClick={onRefreshHero} disabled={liveClientLoading} type="button">
+              {liveClientLoading ? "读取中..." : "读取本地接口"}
+            </button>
+          </div>
+          <label className="apex-field">
+            当前英雄
+            <input
+              value={championName}
+              onChange={(event) => onChampionNameChange(event.currentTarget.value)}
+              placeholder="例如 Ahri 或 阿狸"
+            />
+          </label>
+          <dl>
+            <dt>接口</dt>
+            <dd>{liveClientPlayer ? formatBoolean(liveClientPlayer.available) : "未读取"}</dd>
+            <dt>英雄</dt>
+            <dd>{liveClientPlayer?.championName ?? "-"}</dd>
+            <dt>错误</dt>
+            <dd>{liveClientPlayer?.error ?? "-"}</dd>
+          </dl>
+        </div>
+
+        <div className="info-panel">
+          <div className="panel-title-row">
+            <h2>OCR 来源</h2>
+            <button className="ghost-button compact-button" onClick={onApplyOcrResults} type="button">
+              读取 OCR
+            </button>
+          </div>
+          {hasOcrResults ? (
+            <dl>
+              {[1, 2, 3].map((slot) => {
+                const result = ocrResults.find((item) => item.slot === slot);
+                return (
+                  <React.Fragment key={slot}>
+                    <dt>slot {slot}</dt>
+                    <dd>{result?.matchedName || "未匹配"}</dd>
+                  </React.Fragment>
+                );
+              })}
+            </dl>
+          ) : (
+            <p className="muted">当前没有 Stage 2C OCR 结果，可直接手动输入三 slot 海克斯名称。</p>
+          )}
+        </div>
+      </section>
+
+      <div className="apex-result-list">
+        {[1, 2, 3].map((slot) => {
+          const augmentName = slots[slot - 1] ?? "";
+          const result = results[slot - 1];
+          const currentQueryKey = apexQueryKey(championName, augmentName);
+          const visibleResult = result?.queryKey === currentQueryKey ? result : null;
+          return (
+            <ApexLolSlotCard
+              key={slot}
+              slot={slot}
+              championName={championName}
+              augmentName={augmentName}
+              result={visibleResult}
+              loading={loadingSlots.includes(slot)}
+              onAugmentNameChange={(value) => onSlotChange(slot, value)}
+              onQuery={() => onQuerySlot(slot, false)}
+              onForceRefresh={() => onQuerySlot(slot, true)}
+            />
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+function ApexLolSlotCard({
+  slot,
+  championName,
+  augmentName,
+  result,
+  loading,
+  onAugmentNameChange,
+  onQuery,
+  onForceRefresh,
+}: {
+  slot: number;
+  championName: string;
+  augmentName: string;
+  result: ApexLolSlotResult | null;
+  loading: boolean;
+  onAugmentNameChange: (value: string) => void;
+  onQuery: () => void;
+  onForceRefresh: () => void;
+}) {
+  const hasData = result ? apexResultHasData(result) : false;
+  const ratingLabel = result ? mapApexRatingLabel(result.rating) : "待查询";
+  const rawRating = result?.rating?.trim() || "暂无数据";
+  const status = result?.status ?? "waiting";
+  const error = result?.error?.trim();
+
+  return (
+    <article className={`apex-result-card ${hasData ? "has-data" : "no-data"}`}>
+      <header>
+        <div>
+          <strong>slot {slot}</strong>
+          <span>{championName.trim() || "未填写英雄"} × {augmentName.trim() || "未填写海克斯"}</span>
+        </div>
+        <span className={`badge ${hasData ? "success" : "pending"}`}>{status === "waiting" ? "待查询" : status}</span>
+      </header>
+
+      <label className="apex-field">
+        海克斯名称
+        <input
+          value={augmentName}
+          onChange={(event) => onAugmentNameChange(event.currentTarget.value)}
+          placeholder={`slot ${slot} 海克斯名称`}
+        />
+      </label>
+
+      <div className="apex-rating-row">
+        <span>{ratingLabel}</span>
+        <strong>原始评级：{rawRating}</strong>
+      </div>
+
+      <dl>
+        <dt>rating</dt>
+        <dd>{rawRating}</dd>
+        <dt>英雄 × 海克斯</dt>
+        <dd>{result ? `${result.championName || championName || "-"} × ${result.augmentName || augmentName || "-"}` : `${championName || "-"} × ${augmentName || "-"}`}</dd>
+        <dt>summary</dt>
+        <dd>{hasData ? result?.summary || "暂无摘要" : "暂无数据"}</dd>
+        <dt>tip</dt>
+        <dd>{hasData ? result?.tip || "暂无建议" : "暂无数据"}</dd>
+        <dt>source</dt>
+        <dd>{result?.source || "ApexLOL"}</dd>
+        <dt>sourceUrl</dt>
+        <dd>
+          {result?.sourceUrl ? (
+            <a href={result.sourceUrl} target="_blank" rel="noreferrer">
+              {result.sourceUrl}
+            </a>
+          ) : (
+            "暂无数据"
+          )}
+        </dd>
+        <dt>cacheHit</dt>
+        <dd>{result ? formatBoolean(result.cacheHit) : "否"}</dd>
+        <dt>status</dt>
+        <dd>{status}</dd>
+        <dt>error</dt>
+        <dd>{error || "-"}</dd>
+      </dl>
+
+      {!hasData ? <p className="slot-refresh-note">暂无数据</p> : null}
+
+      <div className="apex-card-actions">
+        <button className="primary-button compact-button" onClick={onQuery} disabled={loading} type="button">
+          {loading ? "查询中..." : "查询本 slot"}
+        </button>
+        <button className="secondary-button compact-button" onClick={onForceRefresh} disabled={loading} type="button">
+          强制本 slot
+        </button>
+      </div>
+    </article>
+  );
+}
+
 function EnvironmentView({
   environment,
   targets,
@@ -2149,10 +2667,17 @@ function OverlayPocPage() {
         .sort((left, right) => left.slot - right.slot)
         .map((card) => (
           <article key={card.slot} className="overlay-card" style={rectToAbsoluteStyle(card.bounds)}>
-            <div className="overlay-card-rating">评级占位 {ratingPlaceholder(card.slot)}</div>
-            <h1>英雄占位 × 海克斯占位</h1>
+            <div className="overlay-card-rating">
+              {card.ratingLabel && card.rating
+                ? `${card.ratingLabel}（${card.rating}）`
+                : ratingPlaceholder(card.slot)}
+            </div>
+            <h1>{card.title || "英雄占位 × 海克斯占位"}</h1>
             <p>{card.body || "当前仅用于验证 Overlay 可见性与位置，不做自动选择。"}</p>
-            <span>数据来源占位：{card.source}</span>
+            <span>
+              来源：{card.source || "POC"}；状态：{card.status ?? "waiting"}
+              {card.cacheHit !== undefined ? `；缓存：${formatBoolean(card.cacheHit)}` : ""}
+            </span>
           </article>
         ))}
     </main>
@@ -2430,6 +2955,111 @@ function formatDateTime(value: string) {
 
 function formatScore(value: number) {
   return Number.isFinite(value) ? value.toFixed(1) : "0.0";
+}
+
+function apexQueryKey(championName: string, augmentName: string) {
+  return `${championName.trim().toLowerCase()}::${augmentName.trim().toLowerCase()}`;
+}
+
+function buildApexNoDataResult(
+  slot: number,
+  championName: string,
+  augmentName: string,
+  queryKey: string,
+): ApexLolSlotResult {
+  const missingFields = [
+    championName.trim() ? "" : "英雄名称",
+    augmentName.trim() ? "" : "海克斯名称",
+  ].filter(Boolean);
+  return {
+    slot,
+    queryKey,
+    championName: championName.trim(),
+    augmentName: augmentName.trim(),
+    rating: "暂无数据",
+    summary: "暂无数据",
+    tip: "暂无数据",
+    source: "ApexLOL",
+    sourceUrl: "",
+    fetchedAt: new Date().toISOString(),
+    cacheHit: false,
+    status: "no_data",
+    error: missingFields.length > 0 ? `请填写${missingFields.join("和")}。` : null,
+  };
+}
+
+function apexResultHasData(result: ApexLolAugmentResult) {
+  return result.status === "ok" && result.rating.trim() !== "" && result.rating.trim() !== "暂无数据";
+}
+
+function mapApexRatingLabel(rating: string) {
+  switch (rating.trim().toUpperCase()) {
+    case "SSS":
+      return "夯爆了";
+    case "SS":
+      return "顶级";
+    case "S":
+    case "A":
+      return "人上人";
+    case "B":
+    case "C":
+      return "NPC";
+    case "D":
+      return "拉完了";
+    default:
+      return "暂无数据";
+  }
+}
+
+function writeApexOverlayState(results: (ApexLolSlotResult | null)[]) {
+  const baseState = readOverlayState() ?? defaultOverlayState();
+  const fallbackCards = defaultOverlayCards(
+    Math.max(baseState.target.logicalBounds.width, 1),
+    Math.max(baseState.target.logicalBounds.height, 1),
+  );
+  const cards = [1, 2, 3].map((slot) => {
+    const result = results[slot - 1];
+    const baseCard =
+      baseState.cards.find((card) => card.slot === slot) ??
+      fallbackCards.find((card) => card.slot === slot) ??
+      defaultOverlayCards(window.innerWidth || 1280, window.innerHeight || 720)[slot - 1];
+    if (!result) {
+      return baseCard;
+    }
+    return apexResultToOverlayCard(result, baseCard);
+  });
+
+  const state: OverlayStoredState = {
+    ...baseState,
+    updatedAt: new Date().toISOString(),
+    label: "apexlol-poc",
+    cards,
+  };
+  window.localStorage.setItem(OVERLAY_STORAGE_KEY, JSON.stringify(state));
+}
+
+function apexResultToOverlayCard(
+  result: ApexLolSlotResult,
+  baseCard: OverlayPocCardInfo,
+): OverlayPocCardInfo {
+  const hasData = apexResultHasData(result);
+  const ratingLabel = mapApexRatingLabel(result.rating);
+  const title = `${result.championName || "未知英雄"} × ${result.augmentName || "未填写海克斯"}`;
+  const summary = hasData ? result.summary || "暂无摘要" : "暂无数据";
+  const tip = hasData ? result.tip || "暂无建议" : result.error || result.summary || "暂无数据";
+
+  return {
+    ...baseCard,
+    slot: result.slot,
+    title,
+    body: hasData ? `${summary} ${tip}`.trim() : `暂无数据：${tip}`,
+    source: result.source || "ApexLOL",
+    rating: result.rating || "暂无数据",
+    ratingLabel,
+    status: result.status,
+    sourceUrl: result.sourceUrl,
+    cacheHit: result.cacheHit,
+  };
 }
 
 function rectToAbsoluteStyle(rect: RectInfo): React.CSSProperties {
