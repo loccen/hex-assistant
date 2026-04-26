@@ -20,6 +20,17 @@ pub struct CaptureRequest {
     pub delay_seconds: u64,
 }
 
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSnapshotRequest {
+    #[serde(default)]
+    pub monitor_id: Option<String>,
+    #[serde(default)]
+    pub delay_seconds: u64,
+    #[serde(default)]
+    pub save_sample: bool,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct CaptureTarget {
@@ -56,6 +67,66 @@ pub struct PixelMetrics {
     pub luma_variance: f64,
     pub near_black_ratio: f64,
     pub sampled_pixels: usize,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationMonitorInfo {
+    pub id: String,
+    pub name: String,
+    pub is_primary: bool,
+    pub bounds: RectInfo,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationSnapshotResult {
+    pub created_at: DateTime<Utc>,
+    pub sample_path: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub monitor: CalibrationMonitorInfo,
+    pub metrics: PixelMetrics,
+    pub black_screen_suspected: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RatioRegion {
+    pub x_ratio: f64,
+    pub y_ratio: f64,
+    pub width_ratio: f64,
+    pub height_ratio: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SlottedRatioRegion {
+    pub slot: u8,
+    pub x_ratio: f64,
+    pub y_ratio: f64,
+    pub width_ratio: f64,
+    pub height_ratio: f64,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationProfile {
+    pub version: u32,
+    pub profile_name: String,
+    pub monitor_id: String,
+    pub monitor_name: String,
+    pub screenshot_width: u32,
+    pub screenshot_height: u32,
+    #[serde(default)]
+    pub dpi_scale: Option<f64>,
+    #[serde(default)]
+    pub display_mode_note: Option<String>,
+    pub language: String,
+    pub name_regions: Vec<SlottedRatioRegion>,
+    pub bottom_anchors: Vec<SlottedRatioRegion>,
+    pub toggle_button_region: RatioRegion,
+    pub overlay: serde_json::Value,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -149,12 +220,59 @@ fn run_capture_diagnostic(
     Ok(report)
 }
 
+#[tauri::command]
+fn capture_calibration_snapshot(
+    app: AppHandle,
+    request: CalibrationSnapshotRequest,
+) -> Result<CalibrationSnapshotResult, String> {
+    let base_dir = app_data_dir(&app)?;
+    let delay_seconds = request.delay_seconds.min(30);
+    if delay_seconds > 0 {
+        thread::sleep(Duration::from_secs(delay_seconds));
+    }
+
+    let snapshots_dir = base_dir.join("calibration").join("snapshots");
+    if request.save_sample {
+        fs::create_dir_all(&snapshots_dir).map_err(|err| err.to_string())?;
+    }
+
+    platform::capture_calibration_snapshot(&request, &snapshots_dir)
+}
+
+#[tauri::command]
+fn save_calibration_profile(app: AppHandle, profile: CalibrationProfile) -> Result<(), String> {
+    validate_calibration_profile(&profile)?;
+
+    let profile_path = calibration_profile_path(&app)?;
+    if let Some(parent) = profile_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    }
+
+    let content = serde_json::to_string_pretty(&profile).map_err(|err| err.to_string())?;
+    fs::write(profile_path, content).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn load_calibration_profile(app: AppHandle) -> Result<Option<CalibrationProfile>, String> {
+    let profile_path = calibration_profile_path(&app)?;
+    if !profile_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(profile_path).map_err(|err| err.to_string())?;
+    let profile = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    Ok(Some(profile))
+}
+
 pub fn run() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
             get_environment_snapshot,
             list_capture_targets,
-            run_capture_diagnostic
+            run_capture_diagnostic,
+            capture_calibration_snapshot,
+            save_calibration_profile,
+            load_calibration_profile
         ])
         .run(tauri::generate_context!())
         .expect("启动屏幕截图诊断工具失败");
@@ -162,6 +280,10 @@ pub fn run() {
 
 fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path().app_data_dir().map_err(|err| err.to_string())
+}
+
+fn calibration_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("calibration").join("profile.json"))
 }
 
 fn environment_snapshot(app_data_dir: &Path) -> EnvironmentSnapshot {
@@ -245,6 +367,95 @@ fn render_log(report: &DiagnosticReport) -> String {
     lines.push(String::new());
     lines.push(format!("[结论] {}", report.summary));
     lines.join("\n")
+}
+
+fn validate_calibration_profile(profile: &CalibrationProfile) -> Result<(), String> {
+    if profile.version == 0 {
+        return Err("校准配置 version 必须大于 0".to_string());
+    }
+    if profile.profile_name.trim().is_empty() {
+        return Err("校准配置 profileName 不能为空".to_string());
+    }
+    if profile.monitor_id.trim().is_empty() {
+        return Err("校准配置 monitorId 不能为空".to_string());
+    }
+    if profile.monitor_name.trim().is_empty() {
+        return Err("校准配置 monitorName 不能为空".to_string());
+    }
+    if profile.screenshot_width == 0 || profile.screenshot_height == 0 {
+        return Err("校准配置截图宽高必须大于 0".to_string());
+    }
+    if let Some(dpi_scale) = profile.dpi_scale {
+        if !dpi_scale.is_finite() || dpi_scale <= 0.0 {
+            return Err("校准配置 dpiScale 必须大于 0".to_string());
+        }
+    }
+    if profile.language.trim().is_empty() {
+        return Err("校准配置 language 不能为空".to_string());
+    }
+
+    validate_slotted_regions("nameRegions", &profile.name_regions)?;
+    validate_slotted_regions("bottomAnchors", &profile.bottom_anchors)?;
+    validate_region("toggleButtonRegion", &profile.toggle_button_region)
+}
+
+fn validate_slotted_regions(label: &str, regions: &[SlottedRatioRegion]) -> Result<(), String> {
+    if regions.len() != 3 {
+        return Err(format!("校准配置 {} 必须包含 3 个区域", label));
+    }
+
+    let mut seen = [false; 3];
+    for region in regions {
+        if !(1..=3).contains(&region.slot) {
+            return Err(format!("校准配置 {} slot 必须为 1、2、3", label));
+        }
+        let index = usize::from(region.slot - 1);
+        if seen[index] {
+            return Err(format!("校准配置 {} slot {} 重复", label, region.slot));
+        }
+        seen[index] = true;
+        validate_region(label, &region.as_ratio_region())?;
+    }
+
+    if seen.iter().all(|exists| *exists) {
+        Ok(())
+    } else {
+        Err(format!("校准配置 {} slot 不完整", label))
+    }
+}
+
+fn validate_region(label: &str, region: &RatioRegion) -> Result<(), String> {
+    validate_ratio(label, "xRatio", region.x_ratio)?;
+    validate_ratio(label, "yRatio", region.y_ratio)?;
+    validate_ratio(label, "widthRatio", region.width_ratio)?;
+    validate_ratio(label, "heightRatio", region.height_ratio)?;
+
+    if region.width_ratio <= 0.0 || region.height_ratio <= 0.0 {
+        return Err(format!("校准配置 {} 宽高比例必须大于 0", label));
+    }
+    if region.x_ratio + region.width_ratio > 1.0 || region.y_ratio + region.height_ratio > 1.0 {
+        return Err(format!("校准配置 {} 区域不能超出截图范围", label));
+    }
+
+    Ok(())
+}
+
+fn validate_ratio(label: &str, field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+        return Err(format!("校准配置 {}.{} 必须在 0..=1 范围内", label, field));
+    }
+    Ok(())
+}
+
+impl SlottedRatioRegion {
+    fn as_ratio_region(&self) -> RatioRegion {
+        RatioRegion {
+            x_ratio: self.x_ratio,
+            y_ratio: self.y_ratio,
+            width_ratio: self.width_ratio,
+            height_ratio: self.height_ratio,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -415,6 +626,13 @@ mod platform {
             ),
         ]
     }
+
+    pub fn capture_calibration_snapshot(
+        _request: &CalibrationSnapshotRequest,
+        _snapshots_dir: &Path,
+    ) -> Result<CalibrationSnapshotResult, String> {
+        Err("当前平台不是 Windows，校准截图需要在 Windows 桌面环境运行".to_string())
+    }
 }
 
 #[cfg(windows)]
@@ -477,6 +695,42 @@ mod platform {
         ]
     }
 
+    pub fn capture_calibration_snapshot(
+        request: &CalibrationSnapshotRequest,
+        snapshots_dir: &Path,
+    ) -> Result<CalibrationSnapshotResult, String> {
+        let monitors = Monitor::all().map_err(|err| err.to_string())?;
+        let selected_index = select_monitor_index(&monitors, request.monitor_id.as_deref())?;
+        let monitor = monitors
+            .get(selected_index)
+            .ok_or_else(|| "未找到可捕获的显示器".to_string())?;
+        let monitor_info = monitor_info(monitor, selected_index)?;
+        let created_at = Utc::now();
+        let save_path = request.save_sample.then(|| {
+            snapshots_dir.join(format!(
+                "calibration-{}-{}.png",
+                created_at.format("%Y%m%d-%H%M%S"),
+                monitor_info.id
+            ))
+        });
+
+        let image = monitor.capture_image().map_err(|err| err.to_string())?;
+        let captured = save_xcap_image(image, save_path.as_deref())?;
+        let metrics = calculate_metrics(&captured.rgba);
+        let black_screen_suspected = metrics.average_luma < 8.0
+            || (metrics.near_black_ratio > 0.985 && metrics.luma_variance < 20.0);
+
+        Ok(CalibrationSnapshotResult {
+            created_at,
+            sample_path: captured.saved_path.map(|path| path.display().to_string()),
+            width: captured.width,
+            height: captured.height,
+            monitor: monitor_info,
+            metrics,
+            black_screen_suspected,
+        })
+    }
+
     fn capture_monitor_with_xcap(save_path: Option<&Path>) -> Result<CapturedImage, String> {
         let monitors = Monitor::all().map_err(|err| err.to_string())?;
         let monitor = monitors
@@ -505,6 +759,49 @@ mod platform {
             .capture_region(x, y, region_width, region_height)
             .map_err(|err| err.to_string())?;
         save_xcap_image(image, save_path)
+    }
+
+    fn select_monitor_index(
+        monitors: &[Monitor],
+        monitor_id: Option<&str>,
+    ) -> Result<usize, String> {
+        if monitors.is_empty() {
+            return Err("未找到可捕获的显示器".to_string());
+        }
+
+        if let Some(id) = monitor_id.filter(|id| !id.trim().is_empty()) {
+            let index_text = id
+                .strip_prefix("monitor-")
+                .ok_or_else(|| format!("不支持的显示器编号: {}", id))?;
+            let index = index_text
+                .parse::<usize>()
+                .map_err(|_| format!("不支持的显示器编号: {}", id))?;
+            if index < monitors.len() {
+                return Ok(index);
+            }
+            return Err(format!("未找到显示器: {}", id));
+        }
+
+        Ok(monitors
+            .iter()
+            .position(|monitor| monitor.is_primary().unwrap_or(false))
+            .unwrap_or(0))
+    }
+
+    fn monitor_info(monitor: &Monitor, index: usize) -> Result<CalibrationMonitorInfo, String> {
+        Ok(CalibrationMonitorInfo {
+            id: format!("monitor-{}", index),
+            name: monitor
+                .friendly_name()
+                .unwrap_or_else(|_| format!("显示器 {}", index + 1)),
+            is_primary: monitor.is_primary().unwrap_or(false),
+            bounds: RectInfo {
+                x: monitor.x().map_err(|err| err.to_string())?,
+                y: monitor.y().map_err(|err| err.to_string())?,
+                width: monitor.width().map_err(|err| err.to_string())?,
+                height: monitor.height().map_err(|err| err.to_string())?,
+            },
+        })
     }
 
     fn save_xcap_image(
