@@ -112,7 +112,58 @@ type CalibrationProfile = {
   };
 };
 
-type Mode = "diagnostic" | "calibration";
+type OverlayPocTargetInfo = {
+  monitorId?: string | null;
+  monitorName?: string | null;
+  source: string;
+  bounds: RectInfo;
+  logicalBounds: RectInfo;
+  scaleFactor: number;
+};
+
+type OverlayPocCardInfo = {
+  slot: number;
+  title: string;
+  body: string;
+  bounds: RectInfo;
+  source: string;
+};
+
+type OverlayPocResult = {
+  created: boolean;
+  label: string;
+  url: string;
+  target: OverlayPocTargetInfo;
+  clickThroughRequested: boolean;
+  clickThroughEnabled: boolean;
+  transparentRequested: boolean;
+  transparentEnabled: boolean;
+  cards: OverlayPocCardInfo[];
+  messages: string[];
+};
+
+type OverlayPocCloseResult = {
+  label: string;
+  closed: boolean;
+  message: string;
+};
+
+type OverlayPocClickThroughResult = {
+  label: string;
+  requested: boolean;
+  applied: boolean;
+  supported: boolean;
+  message: string;
+};
+
+type OverlayStoredState = {
+  updatedAt: string;
+  label: string;
+  target: OverlayPocTargetInfo;
+  cards: OverlayPocCardInfo[];
+};
+
+type Mode = "diagnostic" | "calibration" | "overlay";
 type RegionKey =
   | "name-1"
   | "name-2"
@@ -166,6 +217,8 @@ const DEFAULT_OVERLAY = {
   autoHideAfterMissingMs: 1000,
 };
 
+const OVERLAY_STORAGE_KEY = "hex-assistant.overlayPoc";
+
 function App() {
   const [mode, setMode] = useState<Mode>("diagnostic");
   const [saveSamples, setSaveSamples] = useState(true);
@@ -188,6 +241,12 @@ function App() {
   const [calibrationSaving, setCalibrationSaving] = useState(false);
   const [calibrationError, setCalibrationError] = useState<string | null>(null);
   const [calibrationMessage, setCalibrationMessage] = useState<string | null>(null);
+  const [overlayResult, setOverlayResult] = useState<OverlayPocResult | null>(null);
+  const [overlayCloseResult, setOverlayCloseResult] = useState<OverlayPocCloseResult | null>(null);
+  const [overlayClickThroughResult, setOverlayClickThroughResult] =
+    useState<OverlayPocClickThroughResult | null>(null);
+  const [overlayLoading, setOverlayLoading] = useState(false);
+  const [overlayError, setOverlayError] = useState<string | null>(null);
 
   useEffect(() => {
     void refresh();
@@ -333,6 +392,54 @@ function App() {
     }
   }
 
+  async function openOverlayPoc() {
+    setOverlayLoading(true);
+    setOverlayError(null);
+    setOverlayCloseResult(null);
+    setOverlayClickThroughResult(null);
+    try {
+      const result = await invoke<OverlayPocResult>("open_overlay_poc", {
+        request: {
+          clickThrough: true,
+        },
+      });
+      setOverlayResult(result);
+      writeOverlayState(result);
+    } catch (err) {
+      setOverlayError(String(err));
+    } finally {
+      setOverlayLoading(false);
+    }
+  }
+
+  async function closeOverlayPoc() {
+    setOverlayLoading(true);
+    setOverlayError(null);
+    try {
+      const result = await invoke<OverlayPocCloseResult>("close_overlay_poc");
+      setOverlayCloseResult(result);
+    } catch (err) {
+      setOverlayError(String(err));
+    } finally {
+      setOverlayLoading(false);
+    }
+  }
+
+  async function setOverlayClickThrough(enabled: boolean) {
+    setOverlayLoading(true);
+    setOverlayError(null);
+    try {
+      const result = await invoke<OverlayPocClickThroughResult>("set_overlay_poc_click_through", {
+        enabled,
+      });
+      setOverlayClickThroughResult(result);
+    } catch (err) {
+      setOverlayError(String(err));
+    } finally {
+      setOverlayLoading(false);
+    }
+  }
+
   return (
     <main className="app-shell">
       <section className="top-bar">
@@ -356,11 +463,18 @@ function App() {
             >
               校准
             </button>
+            <button
+              className={mode === "overlay" ? "selected" : ""}
+              onClick={() => setMode("overlay")}
+              type="button"
+            >
+              Overlay POC
+            </button>
           </div>
           <button
             className="ghost-button"
             onClick={refresh}
-            disabled={loading || calibrationLoading || calibrationSaving}
+            disabled={loading || calibrationLoading || calibrationSaving || overlayLoading}
             type="button"
           >
             刷新环境
@@ -381,6 +495,14 @@ function App() {
               onSaveSamplesChange={setSaveSamples}
               onDelaySecondsChange={setDelaySeconds}
               onRunDiagnostic={runDiagnostic}
+            />
+          ) : mode === "overlay" ? (
+            <OverlayControls
+              loading={overlayLoading}
+              hasCalibrationProfile={Boolean(calibrationProfile)}
+              onOpen={openOverlayPoc}
+              onClose={closeOverlayPoc}
+              onSetClickThrough={setOverlayClickThrough}
             />
           ) : (
             <CalibrationControls
@@ -412,6 +534,14 @@ function App() {
             ) : (
               <EmptyState />
             )
+          ) : mode === "overlay" ? (
+            <OverlayWorkspace
+              result={overlayResult}
+              closeResult={overlayCloseResult}
+              clickThroughResult={overlayClickThroughResult}
+              error={overlayError}
+              hasCalibrationProfile={Boolean(calibrationProfile)}
+            />
           ) : (
             <CalibrationWorkspace
               snapshot={calibrationSnapshot}
@@ -591,6 +721,55 @@ function CalibrationControls({
   );
 }
 
+function OverlayControls({
+  loading,
+  hasCalibrationProfile,
+  onOpen,
+  onClose,
+  onSetClickThrough,
+}: {
+  loading: boolean;
+  hasCalibrationProfile: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  onSetClickThrough: (enabled: boolean) => void;
+}) {
+  return (
+    <>
+      <h2>Overlay POC</h2>
+      <div className="target-option selected static-target">
+        <span>
+          <strong>非侵入式透明测试窗口</strong>
+          <small>
+            打开时默认请求点击穿透，只显示三张测试卡片，不接 OCR、不查询 ApexLOL、不做自动选择。
+          </small>
+        </span>
+      </div>
+
+      <div className="overlay-note">
+        {hasCalibrationProfile
+          ? "已读取到校准配置，Overlay 会优先使用底部锚点生成卡片位置。"
+          : "尚未读取到校准配置，Overlay 会使用默认三列测试位置。"}
+      </div>
+
+      <div className="button-stack">
+        <button className="primary-button" onClick={onOpen} disabled={loading} type="button">
+          {loading ? "执行中..." : "打开透明 Overlay"}
+        </button>
+        <button className="secondary-button" onClick={onClose} disabled={loading} type="button">
+          关闭 Overlay
+        </button>
+        <button className="secondary-button" onClick={() => onSetClickThrough(true)} disabled={loading} type="button">
+          启用点击穿透
+        </button>
+        <button className="secondary-button" onClick={() => onSetClickThrough(false)} disabled={loading} type="button">
+          关闭点击穿透
+        </button>
+      </div>
+    </>
+  );
+}
+
 function SharedCaptureOptions({
   saveSamples,
   delaySeconds,
@@ -633,6 +812,135 @@ function SharedCaptureOptions({
         <small>点击后切回要校准的画面，等待自动截图。</small>
       </div>
     </>
+  );
+}
+
+function OverlayWorkspace({
+  result,
+  closeResult,
+  clickThroughResult,
+  error,
+  hasCalibrationProfile,
+}: {
+  result: OverlayPocResult | null;
+  closeResult: OverlayPocCloseResult | null;
+  clickThroughResult: OverlayPocClickThroughResult | null;
+  error: string | null;
+  hasCalibrationProfile: boolean;
+}) {
+  return (
+    <section className="report-panel overlay-workspace">
+      <div className="report-header">
+        <div>
+          <h2>Overlay POC 验证</h2>
+          <p>
+            这是非侵入式 Overlay POC。必须人工分别在窗口、无边框、独占全屏下验证卡片可见性和点击穿透。
+          </p>
+        </div>
+        <span className="report-id">Stage 2B</span>
+      </div>
+
+      {error ? <div className="error-strip">{error}</div> : null}
+      {closeResult ? (
+        <div className={closeResult.closed ? "success-strip" : "overlay-status-strip"}>
+          {closeResult.message} label：{closeResult.label}
+        </div>
+      ) : null}
+      {clickThroughResult ? (
+        <div className={clickThroughResult.applied ? "success-strip" : "overlay-status-strip"}>
+          {clickThroughResult.message} 请求：{formatBoolean(clickThroughResult.requested)}；结果：
+          {formatBoolean(clickThroughResult.applied)}；支持：{formatBoolean(clickThroughResult.supported)}
+        </div>
+      ) : null}
+
+      <div className="overlay-note strong">
+        {hasCalibrationProfile
+          ? "当前有校准配置：后端会优先按 bottomAnchors 计算测试卡片。"
+          : "当前没有校准配置：后端会回退到默认三列测试位置。"}
+      </div>
+
+      {result ? (
+        <>
+          <div className="overlay-result-grid">
+            <div className="info-panel">
+              <h2>窗口</h2>
+              <dl>
+                <dt>label</dt>
+                <dd>{result.label}</dd>
+                <dt>URL</dt>
+                <dd>{result.url}</dd>
+                <dt>已创建</dt>
+                <dd>{formatBoolean(result.created)}</dd>
+              </dl>
+            </div>
+
+            <div className="info-panel">
+              <h2>目标尺寸</h2>
+              <dl>
+                <dt>来源</dt>
+                <dd>{result.target.source}</dd>
+                <dt>逻辑</dt>
+                <dd>{formatRect(result.target.logicalBounds)}</dd>
+                <dt>物理</dt>
+                <dd>{formatRect(result.target.bounds)}</dd>
+                <dt>缩放</dt>
+                <dd>{result.target.scaleFactor.toFixed(2)}</dd>
+              </dl>
+            </div>
+
+            <div className="info-panel">
+              <h2>窗口能力</h2>
+              <dl>
+                <dt>透明请求</dt>
+                <dd>{formatBoolean(result.transparentRequested)}</dd>
+                <dt>透明结果</dt>
+                <dd>{formatBoolean(result.transparentEnabled)}</dd>
+                <dt>穿透请求</dt>
+                <dd>{formatBoolean(result.clickThroughRequested)}</dd>
+                <dt>穿透结果</dt>
+                <dd>{formatBoolean(result.clickThroughEnabled)}</dd>
+              </dl>
+            </div>
+          </div>
+
+          <section className="overlay-card-report">
+            <h2>三张测试卡片坐标</h2>
+            <div className="overlay-card-list">
+              {result.cards.map((card) => (
+                <article key={card.slot} className="attempt-item">
+                  <header>
+                    <strong>slot {card.slot}</strong>
+                    <span className="badge success">{card.source}</span>
+                  </header>
+                  <dl>
+                    <dt>标题</dt>
+                    <dd>{card.title}</dd>
+                    <dt>内容</dt>
+                    <dd>{card.body}</dd>
+                    <dt>坐标</dt>
+                    <dd>{formatRect(card.bounds)}</dd>
+                  </dl>
+                </article>
+              ))}
+            </div>
+          </section>
+
+          <section className="overlay-card-report">
+            <h2>后端消息</h2>
+            <ul className="plain-list">
+              {result.messages.map((message, index) => (
+                <li key={`${message}-${index}`}>{message}</li>
+              ))}
+            </ul>
+          </section>
+        </>
+      ) : (
+        <section className="empty-state">
+          <h2>等待打开 Overlay</h2>
+          <p>点击左侧按钮后，主窗口会展示后端返回的窗口信息、点击穿透结果和三张测试卡片坐标。</p>
+        </section>
+      )}
+    </section>
   );
 }
 
@@ -973,6 +1281,46 @@ function EmptyState() {
   );
 }
 
+function OverlayPocPage() {
+  const [state, setState] = useState<OverlayStoredState>(() => readOverlayState() ?? defaultOverlayState());
+
+  useEffect(() => {
+    document.documentElement.classList.add("overlay-document");
+
+    function refreshOverlayState() {
+      setState(readOverlayState() ?? defaultOverlayState());
+    }
+
+    refreshOverlayState();
+    window.addEventListener("storage", refreshOverlayState);
+    window.addEventListener("resize", refreshOverlayState);
+    const timer = window.setInterval(refreshOverlayState, 500);
+
+    return () => {
+      document.documentElement.classList.remove("overlay-document");
+      window.removeEventListener("storage", refreshOverlayState);
+      window.removeEventListener("resize", refreshOverlayState);
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  return (
+    <main className="overlay-root" aria-label="Overlay POC 测试卡片">
+      {state.cards
+        .slice()
+        .sort((left, right) => left.slot - right.slot)
+        .map((card) => (
+          <article key={card.slot} className="overlay-card" style={rectToAbsoluteStyle(card.bounds)}>
+            <div className="overlay-card-rating">评级占位 {ratingPlaceholder(card.slot)}</div>
+            <h1>英雄占位 × 海克斯占位</h1>
+            <p>{card.body || "当前仅用于验证 Overlay 可见性与位置，不做自动选择。"}</p>
+            <span>数据来源占位：{card.source}</span>
+          </article>
+        ))}
+    </main>
+  );
+}
+
 function pointFromPointer(event: React.PointerEvent<HTMLDivElement>) {
   const rect = event.currentTarget.getBoundingClientRect();
   return {
@@ -1038,6 +1386,95 @@ function formatRegion(region: RatioRegion) {
   return `${region.xRatio.toFixed(4)}, ${region.yRatio.toFixed(4)}, ${region.widthRatio.toFixed(4)}, ${region.heightRatio.toFixed(4)}`;
 }
 
+function formatRect(rect: RectInfo) {
+  return `x=${rect.x}, y=${rect.y}, w=${rect.width}, h=${rect.height}`;
+}
+
+function formatBoolean(value: boolean) {
+  return value ? "是" : "否";
+}
+
+function rectToAbsoluteStyle(rect: RectInfo): React.CSSProperties {
+  return {
+    left: rect.x,
+    top: rect.y,
+    width: rect.width,
+    height: rect.height,
+  };
+}
+
+function ratingPlaceholder(slot: number) {
+  return ["夯爆了", "顶级", "人上人"][slot - 1] ?? "评级占位";
+}
+
+function writeOverlayState(result: OverlayPocResult) {
+  const state: OverlayStoredState = {
+    updatedAt: new Date().toISOString(),
+    label: result.label,
+    target: result.target,
+    cards: result.cards,
+  };
+  window.localStorage.setItem(OVERLAY_STORAGE_KEY, JSON.stringify(state));
+}
+
+function readOverlayState(): OverlayStoredState | null {
+  try {
+    const raw = window.localStorage.getItem(OVERLAY_STORAGE_KEY);
+    if (!raw) {
+      return null;
+    }
+    const parsed = JSON.parse(raw) as OverlayStoredState;
+    if (!Array.isArray(parsed.cards) || !parsed.target) {
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function defaultOverlayState(): OverlayStoredState {
+  const width = Math.max(window.innerWidth || 1280, 1);
+  const height = Math.max(window.innerHeight || 720, 1);
+  return {
+    updatedAt: new Date().toISOString(),
+    label: "overlay-poc",
+    target: {
+      monitorId: null,
+      monitorName: null,
+      source: "frontend.defaultCards",
+      bounds: { x: 0, y: 0, width, height },
+      logicalBounds: { x: 0, y: 0, width, height },
+      scaleFactor: 1,
+    },
+    cards: defaultOverlayCards(width, height),
+  };
+}
+
+function defaultOverlayCards(width: number, height: number): OverlayPocCardInfo[] {
+  const gap = 24;
+  const horizontalPadding = 36;
+  const availableWidth = Math.max(width - horizontalPadding * 2 - gap * 2, 240);
+  const cardWidth = Math.max(120, Math.min(300, Math.floor(availableWidth / 3)));
+  const cardHeight = 118;
+  const totalWidth = cardWidth * 3 + gap * 2;
+  const startX = Math.max(12, Math.floor((width - totalWidth) / 2));
+  const top = Math.max(24, height - cardHeight - 80);
+
+  return [1, 2, 3].map((slot, index) => ({
+    slot,
+    title: `测试卡片 ${slot}`,
+    body: "当前仅用于验证 Overlay 可见性与位置，不做 OCR、不查询 ApexLOL。",
+    bounds: {
+      x: startX + index * (cardWidth + gap),
+      y: top,
+      width: cardWidth,
+      height: cardHeight,
+    },
+    source: "frontend.defaultCards",
+  }));
+}
+
 function clamp(value: number) {
   return Math.max(0, Math.min(1, value));
 }
@@ -1046,8 +1483,11 @@ function roundRatio(value: number) {
   return Math.round(clamp(value) * 10000) / 10000;
 }
 
+const query = new URLSearchParams(window.location.search);
+const isOverlayView = query.get("view") === "overlay";
+
 createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <App />
+    {isOverlayView ? <OverlayPocPage /> : <App />}
   </React.StrictMode>,
 );
