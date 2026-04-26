@@ -230,6 +230,21 @@ type DragSelection = {
 type OcrSlotStatus = "pending" | "recognized" | "suspect" | "manual" | "failed";
 type OcrDebugImageKind = "raw" | "focused" | "enhanced";
 
+type OcrAliasHit = {
+  rawChar: string;
+  nameChar: string;
+  rawIndex: number;
+  nameIndex: number;
+};
+
+type OcrMatchDebug = {
+  normalizedRawText: string;
+  normalizedName: string;
+  distanceScore: number;
+  containsScore: number;
+  aliasHits: OcrAliasHit[];
+};
+
 type OcrCandidateResult = {
   sourceKind: OcrDebugImageKind;
   rawText: string;
@@ -237,6 +252,7 @@ type OcrCandidateResult = {
   matchScore: number;
   matchedName: string;
   status: OcrSlotStatus;
+  matchDebug?: OcrMatchDebug;
 };
 
 type OcrSlotResult = {
@@ -340,6 +356,7 @@ const DEFAULT_OVERLAY = {
 const OVERLAY_STORAGE_KEY = "hex-assistant.overlayPoc";
 const OCR_CONFIDENCE_THRESHOLD = 65;
 const OCR_MATCH_THRESHOLD = 0.72;
+const OCR_ALIAS_MATCH_THRESHOLD = 0.82;
 const OCR_WORKER_PATH = "/ocr-assets/tesseract/worker.min.js";
 const OCR_CORE_PATH = "/ocr-assets/tesseract-core";
 const OCR_LANG_PATH = "/ocr-assets/lang";
@@ -381,6 +398,13 @@ const HEX_NAME_LIBRARY = [
   "最万用的瞄准镜",
   "小猫咪找妈妈",
   "回归基本功",
+];
+const OCR_CONFUSION_GROUPS = [
+  ["猫", "天"],
+  ["咪", "呆"],
+  ["妈", "如", "妇"],
+  ["镜", "饥"],
+  ["准", "淮"],
 ];
 
 function App() {
@@ -1436,6 +1460,7 @@ function App() {
               matchedName: candidate.matchedName,
               matchScore: candidate.matchScore,
               status: candidate.status,
+              matchDebug: candidate.matchDebug,
             })),
           })),
         },
@@ -2433,7 +2458,12 @@ function OcrWorkspace({
                   {result.candidates.map((candidate) => (
                     <div key={candidate.sourceKind} className="ocr-candidate-row">
                       <span>{formatOcrDebugKind(candidate.sourceKind)}</span>
-                      <span>{candidate.rawText || "未识别到文本"}</span>
+                      <span>
+                        {candidate.rawText || "未识别到文本"}
+                        {candidate.matchDebug?.aliasHits.length
+                          ? `；易混字 ${formatOcrAliasHits(candidate.matchDebug.aliasHits)}`
+                          : ""}
+                      </span>
                       <span>{formatScore(candidate.confidence)}</span>
                     </div>
                   ))}
@@ -3367,8 +3397,7 @@ function buildOcrResult(slot: number, rawText: string, confidence: number): OcrS
   const cleanRawText = rawText.replace(/\s+/g, " ").trim();
   const match = matchHexName(cleanRawText);
   const normalizedConfidence = Math.max(0, confidence || 0);
-  const status =
-    normalizedConfidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
+  const status = isOcrMatchAccepted(normalizedConfidence, match) ? "recognized" : "suspect";
 
   return {
     slot,
@@ -3384,6 +3413,16 @@ function buildOcrResult(slot: number, rawText: string, confidence: number): OcrS
   };
 }
 
+function isOcrMatchAccepted(confidence: number, match: ReturnType<typeof matchHexName>) {
+  if (match.score < OCR_MATCH_THRESHOLD) {
+    return false;
+  }
+  if (confidence >= OCR_CONFIDENCE_THRESHOLD) {
+    return true;
+  }
+  return match.score >= OCR_ALIAS_MATCH_THRESHOLD && match.debug.aliasHits.length > 0;
+}
+
 function buildOcrCandidate(sourceKind: OcrDebugImageKind, rawText: string, confidence: number): OcrCandidateResult {
   const result = buildOcrResult(0, rawText, confidence);
   return {
@@ -3393,6 +3432,7 @@ function buildOcrCandidate(sourceKind: OcrDebugImageKind, rawText: string, confi
     matchedName: result.matchedName,
     matchScore: result.matchScore,
     status: result.status,
+    matchDebug: matchHexName(result.rawText).debug,
   };
 }
 
@@ -3448,22 +3488,41 @@ function ocrSourcePriority(sourceKind: OcrDebugImageKind) {
 function matchHexName(rawText: string) {
   const normalizedRawText = normalizeOcrText(rawText);
   if (!normalizedRawText) {
-    return { name: "", score: 0 };
+    return { name: "", score: 0, debug: emptyOcrMatchDebug("") };
   }
 
   return HEX_NAME_LIBRARY.map((name) => {
     const normalizedName = normalizeOcrText(name);
-    const distanceScore = similarityScore(normalizedRawText, normalizedName);
+    const similarity = similarityScore(normalizedRawText, normalizedName);
+    const distanceScore = similarity.score;
     const containsScore =
       normalizedRawText.includes(normalizedName) || normalizedName.includes(normalizedRawText) ? 0.94 : 0;
     return {
       name,
       score: Math.max(distanceScore, containsScore),
+      debug: {
+        normalizedRawText,
+        normalizedName,
+        distanceScore,
+        containsScore,
+        aliasHits: similarity.aliasHits,
+      },
     };
   }).reduce((best, current) => (current.score > best.score ? current : best), {
     name: "",
     score: 0,
+    debug: emptyOcrMatchDebug(normalizedRawText),
   });
+}
+
+function emptyOcrMatchDebug(normalizedRawText: string): OcrMatchDebug {
+  return {
+    normalizedRawText,
+    normalizedName: "",
+    distanceScore: 0,
+    containsScore: 0,
+    aliasHits: [],
+  };
 }
 
 function normalizeOcrText(value: string) {
@@ -3476,26 +3535,29 @@ function normalizeOcrText(value: string) {
 
 function similarityScore(left: string, right: string) {
   if (!left || !right) {
-    return 0;
+    return { score: 0, aliasHits: [] as OcrAliasHit[] };
   }
   if (left === right) {
-    return 1;
+    return { score: 1, aliasHits: [] as OcrAliasHit[] };
   }
 
   const leftChars = Array.from(left);
   const rightChars = Array.from(right);
-  const distance = levenshteinDistance(leftChars, rightChars);
-  return Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length));
+  const distance = weightedLevenshteinDistance(leftChars, rightChars);
+  return {
+    score: Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length)),
+    aliasHits: collectOcrAliasHits(leftChars, rightChars),
+  };
 }
 
-function levenshteinDistance(left: string[], right: string[]) {
+function weightedLevenshteinDistance(left: string[], right: string[]) {
   const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
   const current = new Array<number>(right.length + 1);
 
   for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
     current[0] = leftIndex;
     for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
+      const substitutionCost = ocrSubstitutionCost(left[leftIndex - 1], right[rightIndex - 1]);
       current[rightIndex] = Math.min(
         previous[rightIndex] + 1,
         current[rightIndex - 1] + 1,
@@ -3506,6 +3568,33 @@ function levenshteinDistance(left: string[], right: string[]) {
   }
 
   return previous[right.length];
+}
+
+function ocrSubstitutionCost(left: string, right: string) {
+  if (left === right) {
+    return 0;
+  }
+  return areOcrConfusable(left, right) ? 0.25 : 1;
+}
+
+function areOcrConfusable(left: string, right: string) {
+  return OCR_CONFUSION_GROUPS.some((group) => group.includes(left) && group.includes(right));
+}
+
+function collectOcrAliasHits(left: string[], right: string[]) {
+  const hits: OcrAliasHit[] = [];
+  const maxLength = Math.min(left.length, right.length);
+  for (let index = 0; index < maxLength; index += 1) {
+    if (left[index] !== right[index] && areOcrConfusable(left[index], right[index])) {
+      hits.push({
+        rawChar: left[index],
+        nameChar: right[index],
+        rawIndex: index,
+        nameIndex: index,
+      });
+    }
+  }
+  return hits;
 }
 
 function loadImageElement(src: string) {
@@ -3713,6 +3802,10 @@ function formatOcrDebugKind(kind: OcrDebugImageKind) {
     return "名称行裁剪";
   }
   return "增强裁剪";
+}
+
+function formatOcrAliasHits(hits: OcrAliasHit[]) {
+  return hits.map((hit) => `${hit.rawChar}/${hit.nameChar}`).join("、");
 }
 
 function formatStateMachineStatus(status: StateMachineStatus) {
