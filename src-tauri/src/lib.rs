@@ -10,7 +10,10 @@ use std::{
     thread,
     time::Duration,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+
+const OVERLAY_POC_LABEL: &str = "overlay-poc";
+const OVERLAY_POC_URL: &str = "index.html?view=overlay";
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +43,7 @@ pub struct CaptureTarget {
     pub bounds: Option<RectInfo>,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct RectInfo {
     pub x: i32,
@@ -127,6 +130,96 @@ pub struct CalibrationProfile {
     pub bottom_anchors: Vec<SlottedRatioRegion>,
     pub toggle_button_region: RatioRegion,
     pub overlay: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocRequest {
+    #[serde(default)]
+    pub monitor_id: Option<String>,
+    #[serde(default)]
+    pub target: Option<OverlayPocTargetRequest>,
+    #[serde(default)]
+    pub cards: Vec<OverlayPocCardRequest>,
+    #[serde(default = "default_true")]
+    pub click_through: bool,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocTargetRequest {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocCardRequest {
+    pub slot: u8,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocTargetInfo {
+    pub monitor_id: Option<String>,
+    pub monitor_name: Option<String>,
+    pub source: String,
+    pub bounds: RectInfo,
+    pub logical_bounds: RectInfo,
+    pub scale_factor: f64,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocCardInfo {
+    pub slot: u8,
+    pub title: String,
+    pub body: String,
+    pub bounds: RectInfo,
+    pub source: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocResult {
+    pub created: bool,
+    pub label: String,
+    pub url: String,
+    pub target: OverlayPocTargetInfo,
+    pub click_through_requested: bool,
+    pub click_through_enabled: bool,
+    pub transparent_requested: bool,
+    pub transparent_enabled: bool,
+    pub cards: Vec<OverlayPocCardInfo>,
+    pub messages: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocCloseResult {
+    pub label: String,
+    pub closed: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayPocClickThroughResult {
+    pub label: String,
+    pub requested: bool,
+    pub applied: bool,
+    pub supported: bool,
+    pub message: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -254,14 +347,109 @@ fn save_calibration_profile(app: AppHandle, profile: CalibrationProfile) -> Resu
 
 #[tauri::command]
 fn load_calibration_profile(app: AppHandle) -> Result<Option<CalibrationProfile>, String> {
-    let profile_path = calibration_profile_path(&app)?;
-    if !profile_path.exists() {
-        return Ok(None);
+    read_calibration_profile(&app)
+}
+
+#[tauri::command]
+fn open_overlay_poc(
+    app: AppHandle,
+    request: OverlayPocRequest,
+) -> Result<OverlayPocResult, String> {
+    let mut messages = Vec::new();
+    let profile = read_calibration_profile(&app)?;
+    let target = resolve_overlay_target(&app, &request, profile.as_ref(), &mut messages)?;
+    let cards = resolve_overlay_cards(&request, profile.as_ref(), &target, &mut messages)?;
+
+    if let Some(existing) = app.get_webview_window(OVERLAY_POC_LABEL) {
+        existing.close().map_err(|err| err.to_string())?;
+        messages.push("已关闭旧的 Overlay POC 窗口后重新创建。".to_string());
     }
 
-    let content = fs::read_to_string(profile_path).map_err(|err| err.to_string())?;
-    let profile = serde_json::from_str(&content).map_err(|err| err.to_string())?;
-    Ok(Some(profile))
+    let mut builder = WebviewWindowBuilder::new(
+        &app,
+        OVERLAY_POC_LABEL,
+        WebviewUrl::App(OVERLAY_POC_URL.into()),
+    )
+    .title("Overlay POC")
+    .position(
+        f64::from(target.logical_bounds.x),
+        f64::from(target.logical_bounds.y),
+    )
+    .inner_size(
+        f64::from(target.logical_bounds.width),
+        f64::from(target.logical_bounds.height),
+    )
+    .decorations(false)
+    .always_on_top(true)
+    .focused(false)
+    .focusable(false)
+    .skip_taskbar(true);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        builder = builder.transparent(true);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        messages.push("当前构建未启用 macOS private API，Overlay 透明窗口已降级。".to_string());
+    }
+    let transparent_enabled = cfg!(not(target_os = "macos"));
+
+    let window = builder.build().map_err(|err| err.to_string())?;
+    if let Err(err) = window.set_focusable(false) {
+        messages.push(format!("设置窗口不抢焦点失败: {}", err));
+    }
+
+    let click_through = if request.click_through {
+        let result = set_overlay_click_through(&window, true);
+        messages.push(result.message.clone());
+        result.applied
+    } else {
+        messages.push("请求未启用点击穿透。".to_string());
+        false
+    };
+
+    Ok(OverlayPocResult {
+        created: true,
+        label: OVERLAY_POC_LABEL.to_string(),
+        url: OVERLAY_POC_URL.to_string(),
+        target,
+        click_through_requested: request.click_through,
+        click_through_enabled: click_through,
+        transparent_requested: true,
+        transparent_enabled,
+        cards,
+        messages,
+    })
+}
+
+#[tauri::command]
+fn close_overlay_poc(app: AppHandle) -> Result<OverlayPocCloseResult, String> {
+    if let Some(window) = app.get_webview_window(OVERLAY_POC_LABEL) {
+        window.close().map_err(|err| err.to_string())?;
+        Ok(OverlayPocCloseResult {
+            label: OVERLAY_POC_LABEL.to_string(),
+            closed: true,
+            message: "Overlay POC 窗口已关闭。".to_string(),
+        })
+    } else {
+        Ok(OverlayPocCloseResult {
+            label: OVERLAY_POC_LABEL.to_string(),
+            closed: false,
+            message: "Overlay POC 窗口不存在，无需关闭。".to_string(),
+        })
+    }
+}
+
+#[tauri::command]
+fn set_overlay_poc_click_through(
+    app: AppHandle,
+    enabled: bool,
+) -> Result<OverlayPocClickThroughResult, String> {
+    let window = app
+        .get_webview_window(OVERLAY_POC_LABEL)
+        .ok_or_else(|| "Overlay POC 窗口不存在，请先调用 openOverlayPoc。".to_string())?;
+    Ok(set_overlay_click_through(&window, enabled))
 }
 
 pub fn run() {
@@ -272,7 +460,10 @@ pub fn run() {
             run_capture_diagnostic,
             capture_calibration_snapshot,
             save_calibration_profile,
-            load_calibration_profile
+            load_calibration_profile,
+            open_overlay_poc,
+            close_overlay_poc,
+            set_overlay_poc_click_through
         ])
         .run(tauri::generate_context!())
         .expect("启动屏幕截图诊断工具失败");
@@ -284,6 +475,396 @@ fn app_data_dir(app: &AppHandle) -> Result<PathBuf, String> {
 
 fn calibration_profile_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(app_data_dir(app)?.join("calibration").join("profile.json"))
+}
+
+fn read_calibration_profile(app: &AppHandle) -> Result<Option<CalibrationProfile>, String> {
+    let profile_path = calibration_profile_path(app)?;
+    if !profile_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(profile_path).map_err(|err| err.to_string())?;
+    let profile = serde_json::from_str(&content).map_err(|err| err.to_string())?;
+    Ok(Some(profile))
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn resolve_overlay_target(
+    app: &AppHandle,
+    request: &OverlayPocRequest,
+    profile: Option<&CalibrationProfile>,
+    messages: &mut Vec<String>,
+) -> Result<OverlayPocTargetInfo, String> {
+    if let Some(target) = &request.target {
+        if target.width == 0 || target.height == 0 {
+            return Err("Overlay POC target 宽高必须大于 0".to_string());
+        }
+        messages.push("使用请求传入的 Overlay 目标尺寸。".to_string());
+        return Ok(OverlayPocTargetInfo {
+            monitor_id: request.monitor_id.clone(),
+            monitor_name: None,
+            source: "request.target".to_string(),
+            bounds: RectInfo {
+                x: target.x,
+                y: target.y,
+                width: target.width,
+                height: target.height,
+            },
+            logical_bounds: RectInfo {
+                x: target.x,
+                y: target.y,
+                width: target.width,
+                height: target.height,
+            },
+            scale_factor: 1.0,
+        });
+    }
+
+    let requested_monitor_id = request
+        .monitor_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| profile.map(|profile| profile.monitor_id.as_str()));
+
+    if let Some(main_window) = app.get_webview_window("main") {
+        match main_window.available_monitors() {
+            Ok(monitors) => {
+                if let Some((index, monitor)) =
+                    select_tauri_monitor(&monitors, requested_monitor_id)
+                {
+                    let monitor_id = format!("monitor-{}", index);
+                    let physical_position = monitor.position();
+                    let physical_size = monitor.size();
+                    let scale_factor = monitor.scale_factor();
+                    let logical_x = f64::from(physical_position.x) / scale_factor;
+                    let logical_y = f64::from(physical_position.y) / scale_factor;
+                    let logical_width = f64::from(physical_size.width) / scale_factor;
+                    let logical_height = f64::from(physical_size.height) / scale_factor;
+                    messages.push(format!(
+                        "使用 Tauri 显示器 {} 创建 Overlay POC。",
+                        monitor_id
+                    ));
+                    return Ok(OverlayPocTargetInfo {
+                        monitor_id: Some(monitor_id),
+                        monitor_name: monitor.name().cloned(),
+                        source: "tauri.availableMonitors".to_string(),
+                        bounds: RectInfo {
+                            x: physical_position.x,
+                            y: physical_position.y,
+                            width: physical_size.width,
+                            height: physical_size.height,
+                        },
+                        logical_bounds: RectInfo {
+                            x: round_to_i32(logical_x),
+                            y: round_to_i32(logical_y),
+                            width: round_to_u32(logical_width).max(1),
+                            height: round_to_u32(logical_height).max(1),
+                        },
+                        scale_factor,
+                    });
+                }
+
+                if let Some(id) = requested_monitor_id {
+                    messages.push(format!(
+                        "未在 Tauri 显示器列表中找到 {}，改用校准截图尺寸降级。",
+                        id
+                    ));
+                }
+            }
+            Err(err) => messages.push(format!(
+                "读取 Tauri 显示器列表失败，改用校准截图尺寸降级: {}",
+                err
+            )),
+        }
+    } else {
+        messages.push("未找到 main 窗口，无法读取显示器列表，改用校准截图尺寸降级。".to_string());
+    }
+
+    if let Some(profile) = profile {
+        return Ok(OverlayPocTargetInfo {
+            monitor_id: Some(profile.monitor_id.clone()),
+            monitor_name: Some(profile.monitor_name.clone()),
+            source: "calibration.profileScreenshot".to_string(),
+            bounds: RectInfo {
+                x: 0,
+                y: 0,
+                width: profile.screenshot_width,
+                height: profile.screenshot_height,
+            },
+            logical_bounds: RectInfo {
+                x: 0,
+                y: 0,
+                width: profile.screenshot_width,
+                height: profile.screenshot_height,
+            },
+            scale_factor: profile.dpi_scale.unwrap_or(1.0),
+        });
+    }
+
+    messages.push("未找到校准配置，使用 1280x720 作为 Overlay POC 降级尺寸。".to_string());
+    Ok(OverlayPocTargetInfo {
+        monitor_id: request.monitor_id.clone(),
+        monitor_name: None,
+        source: "fallback.defaultSize".to_string(),
+        bounds: RectInfo {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        },
+        logical_bounds: RectInfo {
+            x: 0,
+            y: 0,
+            width: 1280,
+            height: 720,
+        },
+        scale_factor: 1.0,
+    })
+}
+
+fn select_tauri_monitor<'a>(
+    monitors: &'a [tauri::window::Monitor],
+    requested_monitor_id: Option<&str>,
+) -> Option<(usize, &'a tauri::window::Monitor)> {
+    if monitors.is_empty() {
+        return None;
+    }
+
+    if let Some(id) = requested_monitor_id {
+        if let Some(index_text) = id.strip_prefix("monitor-") {
+            if let Ok(index) = index_text.parse::<usize>() {
+                if let Some(monitor) = monitors.get(index) {
+                    return Some((index, monitor));
+                }
+            }
+        }
+
+        if let Some((index, monitor)) = monitors
+            .iter()
+            .enumerate()
+            .find(|(_, monitor)| monitor.name().is_some_and(|name| name == id))
+        {
+            return Some((index, monitor));
+        }
+
+        return None;
+    }
+
+    Some((0, &monitors[0]))
+}
+
+fn resolve_overlay_cards(
+    request: &OverlayPocRequest,
+    profile: Option<&CalibrationProfile>,
+    target: &OverlayPocTargetInfo,
+    messages: &mut Vec<String>,
+) -> Result<Vec<OverlayPocCardInfo>, String> {
+    if !request.cards.is_empty() {
+        let mut cards = Vec::with_capacity(request.cards.len());
+        for card in &request.cards {
+            if card.width == 0 || card.height == 0 {
+                return Err(format!("Overlay POC 卡片 slot{} 宽高必须大于 0", card.slot));
+            }
+            cards.push(OverlayPocCardInfo {
+                slot: card.slot,
+                title: card
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("测试卡片 {}", card.slot)),
+                body: card
+                    .body
+                    .clone()
+                    .unwrap_or_else(|| "Overlay POC".to_string()),
+                bounds: RectInfo {
+                    x: card.x,
+                    y: card.y,
+                    width: card.width,
+                    height: card.height,
+                },
+                source: "request.cards".to_string(),
+            });
+        }
+        messages.push("使用请求传入的 Overlay 测试卡片位置。".to_string());
+        return Ok(cards);
+    }
+
+    if let Some(profile) = profile {
+        let cards = cards_from_calibration_profile(profile, target);
+        if !cards.is_empty() {
+            messages.push(
+                "已根据 calibration/profile.json 的 bottomAnchors 生成测试卡片位置。".to_string(),
+            );
+            return Ok(cards);
+        }
+    }
+
+    messages.push("未找到可用 bottomAnchors，使用默认三列测试卡片位置。".to_string());
+    Ok(default_overlay_cards(target))
+}
+
+fn cards_from_calibration_profile(
+    profile: &CalibrationProfile,
+    target: &OverlayPocTargetInfo,
+) -> Vec<OverlayPocCardInfo> {
+    let gap = json_u32(&profile.overlay, "gap").unwrap_or(8);
+    let max_height = json_u32(&profile.overlay, "maxHeight").unwrap_or(120);
+    let target_width = target.logical_bounds.width;
+    let target_height = target.logical_bounds.height;
+
+    let mut anchors = profile.bottom_anchors.clone();
+    anchors.sort_by_key(|anchor| anchor.slot);
+
+    anchors
+        .iter()
+        .map(|anchor| {
+            let anchor_rect =
+                ratio_region_to_rect(&anchor.as_ratio_region(), target_width, target_height);
+            let card_height = max_height.min(target_height.max(1));
+            let y = anchor_rect
+                .y
+                .saturating_sub(u32_to_i32_saturating(gap))
+                .saturating_sub(u32_to_i32_saturating(card_height))
+                .max(0);
+            OverlayPocCardInfo {
+                slot: anchor.slot,
+                title: format!("测试卡片 {}", anchor.slot),
+                body: format!("slot {} · Overlay POC", anchor.slot),
+                bounds: RectInfo {
+                    x: anchor_rect.x,
+                    y,
+                    width: anchor_rect.width.max(1),
+                    height: card_height.max(1),
+                },
+                source: "calibration.bottomAnchors".to_string(),
+            }
+        })
+        .collect()
+}
+
+fn default_overlay_cards(target: &OverlayPocTargetInfo) -> Vec<OverlayPocCardInfo> {
+    let width = target.logical_bounds.width;
+    let height = target.logical_bounds.height;
+    let card_width = (width / 5).clamp(180, 320).min(width.max(1));
+    let card_height = 120.min(height.max(1));
+    let gap = 24u32;
+    let total_width = card_width
+        .saturating_mul(3)
+        .saturating_add(gap.saturating_mul(2));
+    let start_x = if width > total_width {
+        (width - total_width) / 2
+    } else {
+        0
+    };
+    let y = height
+        .saturating_sub(card_height)
+        .saturating_sub(80)
+        .min(height.saturating_sub(card_height));
+
+    (0..3)
+        .map(|index| {
+            let slot = index + 1;
+            OverlayPocCardInfo {
+                slot: slot as u8,
+                title: format!("测试卡片 {}", slot),
+                body: "Overlay POC".to_string(),
+                bounds: RectInfo {
+                    x: u32_to_i32_saturating(
+                        start_x + index * card_width + index.saturating_mul(gap),
+                    ),
+                    y: u32_to_i32_saturating(y),
+                    width: card_width,
+                    height: card_height,
+                },
+                source: "fallback.defaultCards".to_string(),
+            }
+        })
+        .collect()
+}
+
+fn ratio_region_to_rect(region: &RatioRegion, width: u32, height: u32) -> RectInfo {
+    RectInfo {
+        x: round_to_i32(region.x_ratio * f64::from(width)),
+        y: round_to_i32(region.y_ratio * f64::from(height)),
+        width: round_to_u32(region.width_ratio * f64::from(width)).max(1),
+        height: round_to_u32(region.height_ratio * f64::from(height)).max(1),
+    }
+}
+
+fn json_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
+fn round_to_i32(value: f64) -> i32 {
+    if value.is_nan() {
+        0
+    } else if value > f64::from(i32::MAX) {
+        i32::MAX
+    } else if value < f64::from(i32::MIN) {
+        i32::MIN
+    } else {
+        value.round() as i32
+    }
+}
+
+fn round_to_u32(value: f64) -> u32 {
+    if value.is_nan() || value <= 0.0 {
+        0
+    } else if value > f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        value.round() as u32
+    }
+}
+
+fn u32_to_i32_saturating(value: u32) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+#[cfg(windows)]
+fn set_overlay_click_through(
+    window: &tauri::WebviewWindow,
+    enabled: bool,
+) -> OverlayPocClickThroughResult {
+    match window.set_ignore_cursor_events(enabled) {
+        Ok(()) => OverlayPocClickThroughResult {
+            label: OVERLAY_POC_LABEL.to_string(),
+            requested: enabled,
+            applied: enabled,
+            supported: true,
+            message: format!(
+                "Windows 点击穿透已{}。",
+                if enabled { "启用" } else { "关闭" }
+            ),
+        },
+        Err(err) => OverlayPocClickThroughResult {
+            label: OVERLAY_POC_LABEL.to_string(),
+            requested: enabled,
+            applied: false,
+            supported: false,
+            message: format!("Windows 点击穿透请求失败: {}", err),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn set_overlay_click_through(
+    _window: &tauri::WebviewWindow,
+    enabled: bool,
+) -> OverlayPocClickThroughResult {
+    OverlayPocClickThroughResult {
+        label: OVERLAY_POC_LABEL.to_string(),
+        requested: enabled,
+        applied: false,
+        supported: false,
+        message: "当前非 Windows 构建，Overlay POC 点击穿透未启用；需要在 Windows 桌面环境实测。"
+            .to_string(),
+    }
 }
 
 fn environment_snapshot(app_data_dir: &Path) -> EnvironmentSnapshot {
