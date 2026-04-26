@@ -6,7 +6,6 @@ import process from "node:process";
 
 const OCR_CONFIDENCE_THRESHOLD = 65;
 const OCR_MATCH_THRESHOLD = 0.72;
-const OCR_ALIAS_MATCH_THRESHOLD = 0.82;
 const HEX_NAME_LIBRARY = [
   "吞噬灵魂",
   "巨像勇气",
@@ -35,13 +34,6 @@ const HEX_NAME_LIBRARY = [
   "最万用的瞄准镜",
   "小猫咪找妈妈",
   "回归基本功",
-];
-const OCR_CONFUSION_GROUPS = [
-  ["猫", "天"],
-  ["咪", "呆"],
-  ["妈", "如", "妇"],
-  ["镜", "饥"],
-  ["准", "淮"],
 ];
 
 const [profilePath, screenshotPath, outputDirArg] = process.argv.slice(2);
@@ -138,21 +130,13 @@ async function tryRecognizeReplay(replay) {
     const results = [];
     for (const slot of replay.slots) {
       const candidates = [];
-      for (const kind of ["enhanced", "focused", "raw"]) {
+      for (const kind of ["tight-enhanced", "inverted", "enhanced", "tight-line", "focused", "raw"]) {
         const crop = slot.crops.find((item) => item.kind === kind);
         if (!crop) {
           continue;
         }
         const recognized = await worker.recognize(crop.path);
         candidates.push(buildCandidate(kind, recognized.data.text, recognized.data.confidence));
-        const best = selectBest(candidates);
-        if (
-          kind === "enhanced" &&
-          best.confidence >= OCR_CONFIDENCE_THRESHOLD &&
-          best.matchScore >= OCR_MATCH_THRESHOLD
-        ) {
-          break;
-        }
       }
       results.push({
         slot: slot.slot,
@@ -168,7 +152,7 @@ async function tryRecognizeReplay(replay) {
     return {
       available: false,
       error: summarizeError(error),
-      note: "已生成 raw/focused/enhanced 调试图；当前环境未完成离线 OCR。",
+      note: "已生成 raw/focused/tight-line/enhanced/tight-enhanced/inverted 调试图；当前环境未完成离线 OCR。",
     };
   } finally {
     if (worker) {
@@ -181,7 +165,8 @@ function buildCandidate(sourceKind, rawText, confidence) {
   const cleanRawText = rawText.replace(/\s+/g, " ").trim();
   const match = matchHexName(cleanRawText);
   const normalizedConfidence = Math.max(0, confidence || 0);
-  const status = isOcrMatchAccepted(normalizedConfidence, match) ? "recognized" : "suspect";
+  const status =
+    normalizedConfidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
   return {
     sourceKind,
     rawText: cleanRawText,
@@ -191,16 +176,6 @@ function buildCandidate(sourceKind, rawText, confidence) {
     status,
     matchDebug: match.debug,
   };
-}
-
-function isOcrMatchAccepted(confidence, match) {
-  if (match.score < OCR_MATCH_THRESHOLD) {
-    return false;
-  }
-  if (confidence >= OCR_CONFIDENCE_THRESHOLD) {
-    return true;
-  }
-  return match.score >= OCR_ALIAS_MATCH_THRESHOLD && match.debug.aliasHits.length > 0;
 }
 
 function selectBest(candidates) {
@@ -223,8 +198,7 @@ function matchHexName(rawText) {
 
   return HEX_NAME_LIBRARY.map((name) => {
     const normalizedName = normalizeOcrText(name);
-    const similarity = similarityScore(normalizedRawText, normalizedName);
-    const distanceScore = similarity.score;
+    const distanceScore = similarityScore(normalizedRawText, normalizedName);
     const containsScore =
       normalizedRawText.includes(normalizedName) || normalizedName.includes(normalizedRawText) ? 0.94 : 0;
     return {
@@ -235,7 +209,6 @@ function matchHexName(rawText) {
         normalizedName,
         distanceScore,
         containsScore,
-        aliasHits: similarity.aliasHits,
       },
     };
   }).reduce((best, current) => (current.score > best.score ? current : best), {
@@ -251,7 +224,6 @@ function emptyOcrMatchDebug(normalizedRawText) {
     normalizedName: "",
     distanceScore: 0,
     containsScore: 0,
-    aliasHits: [],
   };
 }
 
@@ -265,29 +237,26 @@ function normalizeOcrText(value) {
 
 function similarityScore(left, right) {
   if (!left || !right) {
-    return { score: 0, aliasHits: [] };
+    return 0;
   }
   if (left === right) {
-    return { score: 1, aliasHits: [] };
+    return 1;
   }
 
   const leftChars = Array.from(left);
   const rightChars = Array.from(right);
-  const distance = weightedLevenshteinDistance(leftChars, rightChars);
-  return {
-    score: Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length)),
-    aliasHits: collectOcrAliasHits(leftChars, rightChars),
-  };
+  const distance = levenshteinDistance(leftChars, rightChars);
+  return Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length));
 }
 
-function weightedLevenshteinDistance(left, right) {
+function levenshteinDistance(left, right) {
   const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
   const current = new Array(right.length + 1);
 
   for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
     current[0] = leftIndex;
     for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const substitutionCost = ocrSubstitutionCost(left[leftIndex - 1], right[rightIndex - 1]);
+      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
       current[rightIndex] = Math.min(
         previous[rightIndex] + 1,
         current[rightIndex - 1] + 1,
@@ -298,33 +267,6 @@ function weightedLevenshteinDistance(left, right) {
   }
 
   return previous[right.length];
-}
-
-function ocrSubstitutionCost(left, right) {
-  if (left === right) {
-    return 0;
-  }
-  return areOcrConfusable(left, right) ? 0.25 : 1;
-}
-
-function areOcrConfusable(left, right) {
-  return OCR_CONFUSION_GROUPS.some((group) => group.includes(left) && group.includes(right));
-}
-
-function collectOcrAliasHits(left, right) {
-  const hits = [];
-  const maxLength = Math.min(left.length, right.length);
-  for (let index = 0; index < maxLength; index += 1) {
-    if (left[index] !== right[index] && areOcrConfusable(left[index], right[index])) {
-      hits.push({
-        rawChar: left[index],
-        nameChar: right[index],
-        rawIndex: index,
-        nameIndex: index,
-      });
-    }
-  }
-  return hits;
 }
 
 function summarizeError(error) {

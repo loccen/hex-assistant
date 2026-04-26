@@ -96,11 +96,15 @@ fn main() -> Result<(), String> {
         }
         let raw = crop_to_image(&image, &region, 0.0, 1.0, 1);
         let focused = crop_to_image(&image, &region, 0.04, 0.62, 1);
+        let tight_line = crop_bright_text_line(&focused);
         let enhanced = enhance_ocr_image(&focused.image, 4);
+        let tight_enhanced = enhance_ocr_image(&tight_line.image, 4);
+        let inverted = invert_image(&tight_enhanced);
 
         let crops = vec![
             save_crop(&output_dir, region.slot, "raw", raw)?,
             save_crop(&output_dir, region.slot, "focused", focused)?,
+            save_crop(&output_dir, region.slot, "tight-line", tight_line.clone())?,
             save_crop(
                 &output_dir,
                 region.slot,
@@ -108,6 +112,24 @@ fn main() -> Result<(), String> {
                 CropImage {
                     rect: crop_rect(&image, &region, 0.04, 0.62),
                     image: enhanced,
+                },
+            )?,
+            save_crop(
+                &output_dir,
+                region.slot,
+                "tight-enhanced",
+                CropImage {
+                    rect: tight_line.rect,
+                    image: tight_enhanced,
+                },
+            )?,
+            save_crop(
+                &output_dir,
+                region.slot,
+                "inverted",
+                CropImage {
+                    rect: tight_line.rect,
+                    image: inverted,
                 },
             )?,
         ];
@@ -130,6 +152,7 @@ fn main() -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
 struct CropImage {
     rect: PixelRect,
     image: DynamicImage,
@@ -198,6 +221,114 @@ fn enhance_ocr_image(source: &DynamicImage, scale: u32) -> DynamicImage {
         let contrasted = ((luma - 96.0) * 1.85 + 128.0).clamp(0.0, 255.0);
         let value = if contrasted >= 150.0 { 255 } else { 0 };
         output.put_pixel(x, y, Rgba([value, value, value, channels[3]]));
+    }
+    DynamicImage::ImageRgba8(output)
+}
+
+fn crop_bright_text_line(source: &CropImage) -> CropImage {
+    let local_rect = find_bright_text_line_rect(&source.image);
+    let image = source.image.crop_imm(
+        local_rect.x,
+        local_rect.y,
+        local_rect.width,
+        local_rect.height,
+    );
+    CropImage {
+        rect: PixelRect {
+            x: source.rect.x + local_rect.x,
+            y: source.rect.y + local_rect.y,
+            width: local_rect.width,
+            height: local_rect.height,
+        },
+        image,
+    }
+}
+
+fn find_bright_text_line_rect(image: &DynamicImage) -> PixelRect {
+    let rgba = image.to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let mut row_counts = vec![0_u32; height as usize];
+    let mut column_counts = vec![0_u32; width as usize];
+
+    for y in 0..height {
+        for x in 0..width {
+            let channels = rgba.get_pixel(x, y).0;
+            let luma = channels[0] as f64 * 0.299
+                + channels[1] as f64 * 0.587
+                + channels[2] as f64 * 0.114;
+            if luma >= 150.0 {
+                row_counts[y as usize] += 1;
+                column_counts[x as usize] += 1;
+            }
+        }
+    }
+
+    let Some((peak_row, max_row_count)) = row_counts
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, count)| *count)
+        .map(|(index, count)| (index as u32, *count))
+    else {
+        return PixelRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+    };
+
+    if max_row_count == 0 {
+        return PixelRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+    }
+
+    let row_threshold = 3.max((f64::from(max_row_count) * 0.28).floor() as u32);
+    let mut top = peak_row;
+    let mut bottom = peak_row;
+    while top > 0 && row_counts[(top - 1) as usize] >= row_threshold {
+        top -= 1;
+    }
+    while bottom + 1 < height && row_counts[(bottom + 1) as usize] >= row_threshold {
+        bottom += 1;
+    }
+
+    let band_height = bottom - top + 1;
+    let column_threshold = 2.max((f64::from(band_height) * 0.16).floor() as u32);
+    let mut left = 0;
+    let mut right = width - 1;
+    while left < right && column_counts[left as usize] < column_threshold {
+        left += 1;
+    }
+    while right > left && column_counts[right as usize] < column_threshold {
+        right -= 1;
+    }
+
+    let padding_x = 8.max((f64::from(width) * 0.03).round() as u32);
+    let padding_y = 4.max((f64::from(height) * 0.08).round() as u32);
+    left = left.saturating_sub(padding_x);
+    right = (right + padding_x).min(width - 1);
+    top = top.saturating_sub(padding_y);
+    bottom = (bottom + padding_y).min(height - 1);
+
+    PixelRect {
+        x: left,
+        y: top,
+        width: (right - left + 1).max(1),
+        height: (bottom - top + 1).max(1),
+    }
+}
+
+fn invert_image(source: &DynamicImage) -> DynamicImage {
+    let mut output = source.to_rgba8();
+    for pixel in output.pixels_mut() {
+        pixel.0[0] = 255 - pixel.0[0];
+        pixel.0[1] = 255 - pixel.0[1];
+        pixel.0[2] = 255 - pixel.0[2];
     }
     DynamicImage::ImageRgba8(output)
 }

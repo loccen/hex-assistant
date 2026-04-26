@@ -228,21 +228,13 @@ type DragSelection = {
 };
 
 type OcrSlotStatus = "pending" | "recognized" | "suspect" | "manual" | "failed";
-type OcrDebugImageKind = "raw" | "focused" | "enhanced";
-
-type OcrAliasHit = {
-  rawChar: string;
-  nameChar: string;
-  rawIndex: number;
-  nameIndex: number;
-};
+type OcrDebugImageKind = "raw" | "focused" | "tightLine" | "enhanced" | "tightEnhanced" | "inverted";
 
 type OcrMatchDebug = {
   normalizedRawText: string;
   normalizedName: string;
   distanceScore: number;
   containsScore: number;
-  aliasHits: OcrAliasHit[];
 };
 
 type OcrCandidateResult = {
@@ -356,7 +348,6 @@ const DEFAULT_OVERLAY = {
 const OVERLAY_STORAGE_KEY = "hex-assistant.overlayPoc";
 const OCR_CONFIDENCE_THRESHOLD = 65;
 const OCR_MATCH_THRESHOLD = 0.72;
-const OCR_ALIAS_MATCH_THRESHOLD = 0.82;
 const OCR_WORKER_PATH = "/ocr-assets/tesseract/worker.min.js";
 const OCR_CORE_PATH = "/ocr-assets/tesseract-core";
 const OCR_LANG_PATH = "/ocr-assets/lang";
@@ -399,13 +390,7 @@ const HEX_NAME_LIBRARY = [
   "小猫咪找妈妈",
   "回归基本功",
 ];
-const OCR_CONFUSION_GROUPS = [
-  ["猫", "天"],
-  ["咪", "呆"],
-  ["妈", "如", "妇"],
-  ["镜", "饥"],
-  ["准", "淮"],
-];
+const OCR_DEBUG_IMAGE_ORDER: OcrDebugImageKind[] = ["raw", "focused", "tightLine", "enhanced", "tightEnhanced", "inverted"];
 
 function App() {
   const [mode, setMode] = useState<Mode>("diagnostic");
@@ -1368,20 +1353,12 @@ function App() {
           debugCanvases.map((item) => [item.kind, item.canvas.toDataURL("image/png")]),
         ) as Record<OcrDebugImageKind, string>;
 
-        const candidates: OcrCandidateResult[] = [
-          await recognizeOcrCandidate(worker, "enhanced", debugCanvases.find((item) => item.kind === "enhanced")!.canvas),
-        ];
-        const enhancedCandidate = candidates[0];
-        if (
-          enhancedCandidate.confidence < OCR_CONFIDENCE_THRESHOLD ||
-          enhancedCandidate.matchScore < OCR_MATCH_THRESHOLD
-        ) {
-          const fallbackKinds: OcrDebugImageKind[] = ["focused", "raw"];
-          for (const kind of fallbackKinds) {
-            const canvas = debugCanvases.find((item) => item.kind === kind)?.canvas;
-            if (canvas) {
-              candidates.push(await recognizeOcrCandidate(worker, kind, canvas));
-            }
+        const candidates: OcrCandidateResult[] = [];
+        const candidateKinds: OcrDebugImageKind[] = ["tightEnhanced", "inverted", "enhanced", "tightLine", "focused", "raw"];
+        for (const kind of candidateKinds) {
+          const canvas = debugCanvases.find((item) => item.kind === kind)?.canvas;
+          if (canvas) {
+            candidates.push(await recognizeOcrCandidate(worker, kind, canvas));
           }
         }
 
@@ -2458,12 +2435,7 @@ function OcrWorkspace({
                   {result.candidates.map((candidate) => (
                     <div key={candidate.sourceKind} className="ocr-candidate-row">
                       <span>{formatOcrDebugKind(candidate.sourceKind)}</span>
-                      <span>
-                        {candidate.rawText || "未识别到文本"}
-                        {candidate.matchDebug?.aliasHits.length
-                          ? `；易混字 ${formatOcrAliasHits(candidate.matchDebug.aliasHits)}`
-                          : ""}
-                      </span>
+                      <span>{candidate.rawText || "未识别到文本"}</span>
                       <span>{formatScore(candidate.confidence)}</span>
                     </div>
                   ))}
@@ -2473,7 +2445,7 @@ function OcrWorkspace({
                 <div className="ocr-debug-panel">
                   <strong>定位调试图</strong>
                   <div className="ocr-debug-image-grid">
-                    {(["raw", "focused", "enhanced"] as OcrDebugImageKind[]).map((kind) => (
+                    {OCR_DEBUG_IMAGE_ORDER.map((kind) => (
                       <figure key={kind}>
                         {result.debugImages?.[kind] ? (
                           <img src={result.debugImages[kind]} alt={`slot ${result.slot} ${formatOcrDebugKind(kind)}`} />
@@ -2487,7 +2459,7 @@ function OcrWorkspace({
                   {result.debugDirectory ? <p className="debug-path">{result.debugDirectory}</p> : null}
                   {result.debugPaths ? (
                     <dl className="debug-path-list">
-                      {(["raw", "focused", "enhanced"] as OcrDebugImageKind[]).map((kind) =>
+                      {OCR_DEBUG_IMAGE_ORDER.map((kind) =>
                         result.debugPaths?.[kind] ? (
                           <React.Fragment key={kind}>
                             <dt>{formatOcrDebugKind(kind)}</dt>
@@ -3397,7 +3369,8 @@ function buildOcrResult(slot: number, rawText: string, confidence: number): OcrS
   const cleanRawText = rawText.replace(/\s+/g, " ").trim();
   const match = matchHexName(cleanRawText);
   const normalizedConfidence = Math.max(0, confidence || 0);
-  const status = isOcrMatchAccepted(normalizedConfidence, match) ? "recognized" : "suspect";
+  const status =
+    normalizedConfidence < OCR_CONFIDENCE_THRESHOLD || match.score < OCR_MATCH_THRESHOLD ? "suspect" : "recognized";
 
   return {
     slot,
@@ -3411,16 +3384,6 @@ function buildOcrResult(slot: number, rawText: string, confidence: number): OcrS
         ? "疑似结果，需要查看定位调试图或人工修正"
         : "已通过词库匹配",
   };
-}
-
-function isOcrMatchAccepted(confidence: number, match: ReturnType<typeof matchHexName>) {
-  if (match.score < OCR_MATCH_THRESHOLD) {
-    return false;
-  }
-  if (confidence >= OCR_CONFIDENCE_THRESHOLD) {
-    return true;
-  }
-  return match.score >= OCR_ALIAS_MATCH_THRESHOLD && match.debug.aliasHits.length > 0;
 }
 
 function buildOcrCandidate(sourceKind: OcrDebugImageKind, rawText: string, confidence: number): OcrCandidateResult {
@@ -3476,7 +3439,16 @@ function selectBestOcrResult(slot: number, candidates: OcrCandidateResult[]): Oc
 }
 
 function ocrSourcePriority(sourceKind: OcrDebugImageKind) {
+  if (sourceKind === "tightEnhanced") {
+    return 6;
+  }
+  if (sourceKind === "inverted") {
+    return 5;
+  }
   if (sourceKind === "enhanced") {
+    return 4;
+  }
+  if (sourceKind === "tightLine") {
     return 3;
   }
   if (sourceKind === "focused") {
@@ -3493,8 +3465,7 @@ function matchHexName(rawText: string) {
 
   return HEX_NAME_LIBRARY.map((name) => {
     const normalizedName = normalizeOcrText(name);
-    const similarity = similarityScore(normalizedRawText, normalizedName);
-    const distanceScore = similarity.score;
+    const distanceScore = similarityScore(normalizedRawText, normalizedName);
     const containsScore =
       normalizedRawText.includes(normalizedName) || normalizedName.includes(normalizedRawText) ? 0.94 : 0;
     return {
@@ -3505,7 +3476,6 @@ function matchHexName(rawText: string) {
         normalizedName,
         distanceScore,
         containsScore,
-        aliasHits: similarity.aliasHits,
       },
     };
   }).reduce((best, current) => (current.score > best.score ? current : best), {
@@ -3521,7 +3491,6 @@ function emptyOcrMatchDebug(normalizedRawText: string): OcrMatchDebug {
     normalizedName: "",
     distanceScore: 0,
     containsScore: 0,
-    aliasHits: [],
   };
 }
 
@@ -3535,29 +3504,26 @@ function normalizeOcrText(value: string) {
 
 function similarityScore(left: string, right: string) {
   if (!left || !right) {
-    return { score: 0, aliasHits: [] as OcrAliasHit[] };
+    return 0;
   }
   if (left === right) {
-    return { score: 1, aliasHits: [] as OcrAliasHit[] };
+    return 1;
   }
 
   const leftChars = Array.from(left);
   const rightChars = Array.from(right);
-  const distance = weightedLevenshteinDistance(leftChars, rightChars);
-  return {
-    score: Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length)),
-    aliasHits: collectOcrAliasHits(leftChars, rightChars),
-  };
+  const distance = levenshteinDistance(leftChars, rightChars);
+  return Math.max(0, 1 - distance / Math.max(leftChars.length, rightChars.length));
 }
 
-function weightedLevenshteinDistance(left: string[], right: string[]) {
+function levenshteinDistance(left: string[], right: string[]) {
   const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
   const current = new Array<number>(right.length + 1);
 
   for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
     current[0] = leftIndex;
     for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
-      const substitutionCost = ocrSubstitutionCost(left[leftIndex - 1], right[rightIndex - 1]);
+      const substitutionCost = left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1;
       current[rightIndex] = Math.min(
         previous[rightIndex] + 1,
         current[rightIndex - 1] + 1,
@@ -3568,33 +3534,6 @@ function weightedLevenshteinDistance(left: string[], right: string[]) {
   }
 
   return previous[right.length];
-}
-
-function ocrSubstitutionCost(left: string, right: string) {
-  if (left === right) {
-    return 0;
-  }
-  return areOcrConfusable(left, right) ? 0.25 : 1;
-}
-
-function areOcrConfusable(left: string, right: string) {
-  return OCR_CONFUSION_GROUPS.some((group) => group.includes(left) && group.includes(right));
-}
-
-function collectOcrAliasHits(left: string[], right: string[]) {
-  const hits: OcrAliasHit[] = [];
-  const maxLength = Math.min(left.length, right.length);
-  for (let index = 0; index < maxLength; index += 1) {
-    if (left[index] !== right[index] && areOcrConfusable(left[index], right[index])) {
-      hits.push({
-        rawChar: left[index],
-        nameChar: right[index],
-        rawIndex: index,
-        nameIndex: index,
-      });
-    }
-  }
-  return hits;
 }
 
 function loadImageElement(src: string) {
@@ -3609,12 +3548,18 @@ function loadImageElement(src: string) {
 function buildOcrDebugCanvases(image: HTMLImageElement, region: SlottedRatioRegion) {
   const rawCanvas = cropRegionToCanvas(image, region, { yOffsetRatio: 0, heightRatio: 1, scale: 1 });
   const focusedCanvas = cropRegionToCanvas(image, region, { yOffsetRatio: 0.04, heightRatio: 0.62, scale: 1 });
+  const tightLineCanvas = cropBrightTextLineCanvas(focusedCanvas);
   const enhancedCanvas = enhanceOcrCanvas(focusedCanvas, 4);
+  const tightEnhancedCanvas = enhanceOcrCanvas(tightLineCanvas, 4);
+  const invertedCanvas = invertCanvas(tightEnhancedCanvas);
 
   return [
     { kind: "raw" as const, canvas: rawCanvas },
     { kind: "focused" as const, canvas: focusedCanvas },
+    { kind: "tightLine" as const, canvas: tightLineCanvas },
     { kind: "enhanced" as const, canvas: enhancedCanvas },
+    { kind: "tightEnhanced" as const, canvas: tightEnhancedCanvas },
+    { kind: "inverted" as const, canvas: invertedCanvas },
   ];
 }
 
@@ -3645,6 +3590,84 @@ function cropRegionToCanvas(
   return canvas;
 }
 
+function cropBrightTextLineCanvas(source: HTMLCanvasElement) {
+  const context = source.getContext("2d");
+  if (!context) {
+    throw new Error("当前环境无法读取 OCR 名称行画布。");
+  }
+
+  const imageData = context.getImageData(0, 0, source.width, source.height);
+  const rect = findBrightTextLineRect(imageData, source.width, source.height);
+  const canvas = document.createElement("canvas");
+  canvas.width = rect.width;
+  canvas.height = rect.height;
+  const targetContext = canvas.getContext("2d");
+  if (!targetContext) {
+    throw new Error("当前环境无法创建 OCR 名称行画布。");
+  }
+
+  targetContext.imageSmoothingEnabled = false;
+  targetContext.drawImage(source, rect.x, rect.y, rect.width, rect.height, 0, 0, rect.width, rect.height);
+  return canvas;
+}
+
+function findBrightTextLineRect(imageData: ImageData, width: number, height: number) {
+  const data = imageData.data;
+  const rowCounts = Array.from({ length: height }, () => 0);
+  const columnCounts = Array.from({ length: width }, () => 0);
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = (y * width + x) * 4;
+      const luma = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+      if (luma >= 150) {
+        rowCounts[y] += 1;
+        columnCounts[x] += 1;
+      }
+    }
+  }
+
+  const maxRowCount = Math.max(...rowCounts);
+  if (maxRowCount <= 0) {
+    return { x: 0, y: 0, width, height };
+  }
+
+  const rowThreshold = Math.max(3, Math.floor(maxRowCount * 0.28));
+  const peakRow = rowCounts.indexOf(maxRowCount);
+  let top = peakRow;
+  let bottom = peakRow;
+  while (top > 0 && rowCounts[top - 1] >= rowThreshold) {
+    top -= 1;
+  }
+  while (bottom < height - 1 && rowCounts[bottom + 1] >= rowThreshold) {
+    bottom += 1;
+  }
+
+  const columnThreshold = Math.max(2, Math.floor((bottom - top + 1) * 0.16));
+  let left = 0;
+  let right = width - 1;
+  while (left < right && columnCounts[left] < columnThreshold) {
+    left += 1;
+  }
+  while (right > left && columnCounts[right] < columnThreshold) {
+    right -= 1;
+  }
+
+  const paddingX = Math.max(8, Math.round(width * 0.03));
+  const paddingY = Math.max(4, Math.round(height * 0.08));
+  left = Math.max(0, left - paddingX);
+  right = Math.min(width - 1, right + paddingX);
+  top = Math.max(0, top - paddingY);
+  bottom = Math.min(height - 1, bottom + paddingY);
+
+  return {
+    x: left,
+    y: top,
+    width: Math.max(1, right - left + 1),
+    height: Math.max(1, bottom - top + 1),
+  };
+}
+
 function enhanceOcrCanvas(source: HTMLCanvasElement, scale: number) {
   const canvas = document.createElement("canvas");
   canvas.width = source.width * scale;
@@ -3666,6 +3689,27 @@ function enhanceOcrCanvas(source: HTMLCanvasElement, scale: number) {
     data[index] = value;
     data[index + 1] = value;
     data[index + 2] = value;
+  }
+  context.putImageData(imageData, 0, 0);
+  return canvas;
+}
+
+function invertCanvas(source: HTMLCanvasElement) {
+  const canvas = document.createElement("canvas");
+  canvas.width = source.width;
+  canvas.height = source.height;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    throw new Error("当前环境无法创建 OCR 反色画布。");
+  }
+
+  context.drawImage(source, 0, 0);
+  const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+  const data = imageData.data;
+  for (let index = 0; index < data.length; index += 4) {
+    data[index] = 255 - data[index];
+    data[index + 1] = 255 - data[index + 1];
+    data[index + 2] = 255 - data[index + 2];
   }
   context.putImageData(imageData, 0, 0);
   return canvas;
@@ -3799,13 +3843,18 @@ function formatOcrDebugKind(kind: OcrDebugImageKind) {
     return "原始裁剪";
   }
   if (kind === "focused") {
-    return "名称行裁剪";
+    return "固定名称行";
+  }
+  if (kind === "tightLine") {
+    return "投影名称行";
+  }
+  if (kind === "tightEnhanced") {
+    return "投影增强";
+  }
+  if (kind === "inverted") {
+    return "反色增强";
   }
   return "增强裁剪";
-}
-
-function formatOcrAliasHits(hits: OcrAliasHit[]) {
-  return hits.map((hit) => `${hit.rawChar}/${hit.nameChar}`).join("、");
 }
 
 function formatStateMachineStatus(status: StateMachineStatus) {
