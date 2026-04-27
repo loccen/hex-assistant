@@ -1,3 +1,5 @@
+pub mod ocr_engine;
+
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
