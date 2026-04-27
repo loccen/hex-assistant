@@ -192,7 +192,9 @@ GET https://127.0.0.1:2999/liveclientdata/activeplayer
 
 OCR 不全局持续运行。
 
-当前 Tesseract 只作为 POC 和调试基线使用，不适合作为本项目最终 OCR 核心方案。已建设的重点是用户校准区域裁剪、名称行定位、样本离线回放、调试图保存和候选输出。OCR 引擎本身必须后续单独评估或替换，不能靠针对单个样本的错字映射、符文名特化混淆字表或低置信度强行匹配来制造通过结果。
+当前 OCR 落地目标为 **RapidOCR + ONNXRuntime**，通过 Python sidecar（`scripts/ocr_sidecar.py`）调用。离线回归评估（`scripts/eval-rapidocr.mjs`）在 5 张 2560×1440 真实截图上达到 15/15 exact match，未使用符文名错字表或样本特化纠错。模型完全本地离线，不依赖在线服务。
+
+Tesseract 只保留为调试基线，在 `scripts/replay-ocr-debug.mjs` 的 Tesseract 分支中使用，不能靠针对单个样本的错字映射、符文名特化混淆字表或低置信度强行匹配来制造通过结果。
 
 整体原则是：
 

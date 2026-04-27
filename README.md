@@ -20,14 +20,14 @@
 - 截图诊断：支持目标显示器截图、主显示器截图、中心区域截图，导出日志、JSON 和 PNG 样本，用于判断截图是否成功、是否黑屏。
 - 校准与区域保存：支持保存截图尺寸、归一化坐标、名称 OCR 区域、底部锚点区域、展示 / 隐藏按钮区域，并可重新加载。
 - Overlay POC：支持按校准锚点渲染三张说明卡片，用于验证位置、显示和隐藏逻辑。
-- OCR POC：支持对校准后的名称区域生成裁剪图、增强图和候选 OCR 输出，并结合词库做保守匹配；Tesseract 仅作为 POC / 调试基线，不作为最终 OCR 核心方案。
+- OCR 引擎：当前 OCR 落地目标为 RapidOCR + ONNXRuntime（离线本地模型，5 张回归样本 15/15 exact match，不使用特化纠错）；Tesseract 仅保留为调试基线。支持对校准后的名称区域生成裁剪图、增强图和候选 OCR 输出，并结合词库做保守匹配。
 - Live Client API 与状态机 POC：支持通过本地允许接口读取状态信息，并用状态机区分普通监听、等级满足、面板收起、面板展开、当前轮处理等状态。
 - ApexLOL 后端查询 / 缓存接口：支持按英雄和海克斯查询后端接口并写入缓存，前端查询展示 POC 已实现；真实来源解析稳定性、Overlay 局内展示和真实样本验收仍待完成。
 
 ## 未完成和待实测
 
 - 真实 Windows 桌面环境下的 Overlay 可见性和点击穿透仍需实测，尤其是游戏窗口、无边框和全屏场景。
-- OCR 引擎仍需单独评估或替换。不能靠单样本错字映射、符文名特化混淆字表或低置信度强行匹配来制造通过结果。
+- OCR 引擎已定：RapidOCR + ONNXRuntime（`scripts/ocr_sidecar.py`），离线回归评估 `scripts/eval-rapidocr.mjs` 已通过 15/15。Tesseract 只保留为 `replay-ocr-debug.mjs` 的调试基线，不能靠特化错字表制造通过结果。
 - ApexLOL 查询缓存和前端查询展示 POC 已实现，真实来源解析稳定性、Overlay 局内展示和真实样本验收仍待完成。
 - 完整自动状态机还未完成，当前是 POC 级流程验证，不能视为最终自动化逻辑已经通过验收。
 - 多显示器、分辨率变化、UI 缩放变化后的完整回归仍需补齐。
@@ -62,7 +62,23 @@ ApexLOL 解析当前采用保守解析策略；请求失败、页面结构不匹
 mise trust
 mise install
 mise exec -- npm install
+# 安装 RapidOCR Python 依赖（首次需要）
+mise exec python -- pip install rapidocr-onnxruntime
 ```
+
+## OCR 回归评估
+
+```bash
+mise exec -- node scripts/eval-rapidocr.mjs
+```
+
+验收目标：15/15 exact match。结果输出到 `artifacts/ocr-race/results/rapidocr-regression/`。
+
+OCR 依赖说明：
+- Python 包：`rapidocr-onnxruntime`（包含 onnxruntime、opencv-python），通过 mise Python 3.11 安装。
+- 模型缓存：`~/.RapidOCR/`，首次运行自动下载，后续离线可用。
+- 项目目录无污染，不进 `node_modules`，不进 `src-tauri`。
+- 打包分发：后续可用 PyInstaller 将 `ocr_sidecar.py` 打包为独立可执行文件，Rust 端通过 `Command::new` 调用 sidecar。
 
 ## 开发运行
 

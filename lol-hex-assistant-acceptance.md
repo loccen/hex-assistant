@@ -15,7 +15,7 @@
 当前仍需后续完成或实测：
 
 - 真实 Windows 桌面环境下的 Overlay 可见性和点击穿透，尤其是窗口、无边框、全屏三类显示模式。
-- OCR 引擎评估和替换方案。Tesseract 只作为 POC / 调试基线，不作为最终 OCR 核心方案。
+- OCR 引擎已定为 RapidOCR + ONNXRuntime（`scripts/ocr_sidecar.py`），离线回归评估 15/15 通过。Tesseract 只保留为调试基线。仍需在真实游戏无边框样本上验收，覆盖不同地图、缩放、画质。
 - ApexLOL 真实来源解析稳定性、Overlay 联动和真实样本验收。
 - 完整自动状态机，包括多档位连续处理、重随后的 slot 级刷新、异常恢复和长时间局内运行。
 
@@ -34,7 +34,7 @@ mise exec -- npm run tauri dev
 | --- | --- | --- |
 | Stage 2A 截图与校准基础 | POC 已实现截图诊断、校准区域保存和回显能力 | 真实窗口 / 无边框 / 全屏截图样本和回归记录 |
 | Stage 2B Overlay POC | POC 已实现按校准锚点展示说明卡片 | Windows 桌面真实 Overlay 可见性、点击穿透和多显示器记录 |
-| Stage 2C OCR 与词库纠错 | 已建设裁剪定位、样本回放、调试图和候选输出能力；Tesseract 仅作 POC 基线 | 多真实样本 OCR 引擎评估、替换方案、低置信度和手动修正记录 |
+| Stage 2C OCR 与词库纠错 | RapidOCR+ONNXRuntime 已定为核心引擎，离线 5 样本 15/15；sidecar + eval 脚本已实现 | 真实游戏无边框样本、多地图缩放、低置信度异常处理和手动修正记录 |
 | Stage 2D 本地接口与状态机 | POC 已实现 Live Client API 接入和基础状态机 | 完整多档位、重随、异常恢复和长时间运行记录 |
 | Stage 2E ApexLOL 查询与展示 | 查询缓存和前端展示 POC 已实现，真实样本与 Overlay 联动验收待完成 | 来源展示、真实解析稳定性、Overlay 联动和失败兜底记录 |
 

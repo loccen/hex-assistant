@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 *)",
+      "Bash(python3 *)",
+      "Bash(mise exec *)",
+      "Bash(mise install *)",
+      "Bash(cargo *)",
+      "Bash(npm *)",
+      "Bash(node *)"
+    ]
+  }
+}

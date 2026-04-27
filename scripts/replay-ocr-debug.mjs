@@ -116,6 +116,94 @@ function runCropper(profile, screenshot, output) {
 }
 
 async function tryRecognizeReplay(replay) {
+  // 优先 RapidOCR，Tesseract 只作调试基线
+  const rapidResult = await tryRecognizeWithRapidOCR(replay);
+  if (rapidResult.available) {
+    return rapidResult;
+  }
+  return tryRecognizeWithTesseract(replay);
+}
+
+async function tryRecognizeWithRapidOCR(replay) {
+  const { spawn } = await import("node:child_process");
+  const { existsSync } = await import("node:fs");
+  const sidecarPath = new URL("./ocr_sidecar.py", import.meta.url).pathname;
+  if (!existsSync(sidecarPath)) {
+    return { available: false, engine: "RapidOCR+ONNXRuntime", error: "ocr_sidecar.py 不存在" };
+  }
+
+  // 用 tight-enhanced 或 tight-line 裁剪图，优先前者
+  const cropKindPriority = ["tight-enhanced", "tight-line", "focused", "raw"];
+  const crops = replay.slots
+    .map((slot) => {
+      const crop = cropKindPriority.map((k) => slot.crops.find((c) => c.kind === k)).find(Boolean);
+      return crop ? { slot: slot.slot, path: crop.path, kind: crop.kind } : null;
+    })
+    .filter(Boolean);
+
+  if (crops.length === 0) {
+    return { available: false, engine: "RapidOCR+ONNXRuntime", error: "无可用裁剪图" };
+  }
+
+  const payload = JSON.stringify({ crops });
+
+  const sidecarOutput = await new Promise((resolve, reject) => {
+    const child = spawn(
+      "mise",
+      ["exec", "python", "--", "python", sidecarPath],
+      { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => { stdout += c.toString(); });
+    child.stderr.on("data", (c) => { stderr += c.toString(); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(`RapidOCR sidecar 退出 ${code}: ${stderr.trim().slice(0, 200)}`));
+        return;
+      }
+      try { resolve(JSON.parse(stdout)); }
+      catch (e) { reject(new Error(`解析 sidecar 输出失败: ${e.message}`)); }
+    });
+    child.stdin.write(payload);
+    child.stdin.end();
+  }).catch((err) => ({ error: summarizeError(err) }));
+
+  if (sidecarOutput.error) {
+    return { available: false, engine: "RapidOCR+ONNXRuntime", error: sidecarOutput.error };
+  }
+
+  const results = sidecarOutput.slots.map((s) => {
+    const rawText = (s.rawText ?? "").replace(/\s+/g, " ").trim();
+    const match = matchHexName(rawText);
+    const status = s.confidence >= OCR_CONFIDENCE_THRESHOLD / 100 && match.score >= OCR_MATCH_THRESHOLD
+      ? "recognized"
+      : "suspect";
+    return {
+      slot: s.slot,
+      engine: "RapidOCR+ONNXRuntime",
+      rawText,
+      confidence: Math.round((s.confidence ?? 0) * 100),
+      matchedName: status === "recognized" ? match.name : "",
+      matchScore: match.score,
+      status,
+      matchDebug: match.debug,
+      durationMs: s.durationMs,
+      candidates: s.candidates ?? [],
+    };
+  });
+
+  return {
+    available: true,
+    engine: "RapidOCR+ONNXRuntime",
+    version: sidecarOutput.version,
+    durationMs: sidecarOutput.durationMs,
+    results,
+  };
+}
+
+async function tryRecognizeWithTesseract(replay) {
   let worker;
   try {
     const { default: Tesseract } = await import("tesseract.js");
@@ -146,11 +234,13 @@ async function tryRecognizeReplay(replay) {
     }
     return {
       available: true,
+      engine: "Tesseract (debug baseline)",
       results,
     };
   } catch (error) {
     return {
       available: false,
+      engine: "Tesseract (debug baseline)",
       error: summarizeError(error),
       note: "已生成 raw/focused/tight-line/enhanced/tight-enhanced/inverted 调试图；当前环境未完成离线 OCR。",
     };
