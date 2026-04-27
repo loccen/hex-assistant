@@ -192,7 +192,7 @@ GET https://127.0.0.1:2999/liveclientdata/activeplayer
 
 OCR 不全局持续运行。
 
-当前 OCR 落地目标为 **RapidOCR + ONNXRuntime**，通过 Python sidecar（`scripts/ocr_sidecar.py`）调用。离线回归评估（`scripts/eval-rapidocr.mjs`）在 5 张 2560×1440 真实截图上达到 15/15 exact match，未使用符文名错字表或样本特化纠错。模型完全本地离线，不依赖在线服务。
+当前 OCR 落地目标为 **PP-OCRv4 rec via Rust ort crate**（`src-tauri/src/ocr_engine.rs`）。仅使用 rec 模型（10MB），跳过 det/cls，字符表内嵌于模型 metadata。离线回归评估（`scripts/eval-rapidocr.mjs` → `cargo run --bin ocr_eval`）在 5 张 2560×1440 真实截图上达到 15/15 exact match，未使用符文名错字表或样本特化纠错。模型完全本地离线，不依赖在线服务，打包体积约 25MB（无 Python 依赖）。
 
 Tesseract 只保留为调试基线，在 `scripts/replay-ocr-debug.mjs` 的 Tesseract 分支中使用，不能靠针对单个样本的错字映射、符文名特化混淆字表或低置信度强行匹配来制造通过结果。
 

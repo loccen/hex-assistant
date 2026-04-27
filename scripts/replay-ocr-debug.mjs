@@ -125,13 +125,6 @@ async function tryRecognizeReplay(replay) {
 }
 
 async function tryRecognizeWithRapidOCR(replay) {
-  const { spawn } = await import("node:child_process");
-  const { existsSync } = await import("node:fs");
-  const sidecarPath = new URL("./ocr_sidecar.py", import.meta.url).pathname;
-  if (!existsSync(sidecarPath)) {
-    return { available: false, engine: "RapidOCR+ONNXRuntime", error: "ocr_sidecar.py 不存在" };
-  }
-
   // 用 tight-enhanced 或 tight-line 裁剪图，优先前者
   const cropKindPriority = ["tight-enhanced", "tight-line", "focused", "raw"];
   const crops = replay.slots
@@ -142,16 +135,16 @@ async function tryRecognizeWithRapidOCR(replay) {
     .filter(Boolean);
 
   if (crops.length === 0) {
-    return { available: false, engine: "RapidOCR+ONNXRuntime", error: "无可用裁剪图" };
+    return { available: false, engine: "PP-OCRv4/Rust ort", error: "无可用裁剪图" };
   }
 
   const payload = JSON.stringify({ crops });
 
-  const sidecarOutput = await new Promise((resolve, reject) => {
+  const ocrOutput = await new Promise((resolve, reject) => {
     const child = spawn(
-      "mise",
-      ["exec", "python", "--", "python", sidecarPath],
-      { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"] },
+      "cargo",
+      ["run", "--quiet", "--manifest-path", "src-tauri/Cargo.toml", "--bin", "ocr_crops"],
+      { cwd: process.cwd(), stdio: ["pipe", "pipe", "pipe"], env: process.env },
     );
     let stdout = "";
     let stderr = "";
@@ -160,21 +153,21 @@ async function tryRecognizeWithRapidOCR(replay) {
     child.on("error", reject);
     child.on("close", (code) => {
       if (code !== 0) {
-        reject(new Error(`RapidOCR sidecar 退出 ${code}: ${stderr.trim().slice(0, 200)}`));
+        reject(new Error(`ocr_crops 退出 ${code}: ${stderr.trim().slice(0, 200)}`));
         return;
       }
       try { resolve(JSON.parse(stdout)); }
-      catch (e) { reject(new Error(`解析 sidecar 输出失败: ${e.message}`)); }
+      catch (e) { reject(new Error(`解析 ocr_crops 输出失败: ${e.message}`)); }
     });
     child.stdin.write(payload);
     child.stdin.end();
   }).catch((err) => ({ error: summarizeError(err) }));
 
-  if (sidecarOutput.error) {
-    return { available: false, engine: "RapidOCR+ONNXRuntime", error: sidecarOutput.error };
+  if (ocrOutput.error) {
+    return { available: false, engine: "PP-OCRv4/Rust ort", error: ocrOutput.error };
   }
 
-  const results = sidecarOutput.slots.map((s) => {
+  const results = ocrOutput.slots.map((s) => {
     const rawText = (s.rawText ?? "").replace(/\s+/g, " ").trim();
     const match = matchHexName(rawText);
     const status = s.confidence >= OCR_CONFIDENCE_THRESHOLD / 100 && match.score >= OCR_MATCH_THRESHOLD
@@ -182,7 +175,7 @@ async function tryRecognizeWithRapidOCR(replay) {
       : "suspect";
     return {
       slot: s.slot,
-      engine: "RapidOCR+ONNXRuntime",
+      engine: "PP-OCRv4/Rust ort",
       rawText,
       confidence: Math.round((s.confidence ?? 0) * 100),
       matchedName: status === "recognized" ? match.name : "",
@@ -190,15 +183,14 @@ async function tryRecognizeWithRapidOCR(replay) {
       status,
       matchDebug: match.debug,
       durationMs: s.durationMs,
-      candidates: s.candidates ?? [],
+      candidates: [],
     };
   });
 
   return {
     available: true,
-    engine: "RapidOCR+ONNXRuntime",
-    version: sidecarOutput.version,
-    durationMs: sidecarOutput.durationMs,
+    engine: "PP-OCRv4/Rust ort",
+    durationMs: ocrOutput.durationMs,
     results,
   };
 }
