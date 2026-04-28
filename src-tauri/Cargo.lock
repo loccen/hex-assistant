@@ -4613,6 +4613,7 @@ dependencies = [
  "ndarray",
  "ort",
  "os_info",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",

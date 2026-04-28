@@ -525,6 +525,18 @@ function App() {
     previousQueueSignatureRef.current = queueSignature;
   }, [pendingMilestoneQueue, queueSignature]);
 
+  // Esc 应急关闭 Overlay：万一点击穿透还是把主窗口锁死，
+  // 用户 Alt+Tab 切到主窗口按 Esc 仍能关掉 overlay。
+  useEffect(() => {
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        invoke("close_overlay_poc").catch(() => {});
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
   async function refreshTestLogPaths() {
     setTestLogLoading(true);
     try {
@@ -1509,73 +1521,68 @@ function App() {
   return (
     <main className="app-shell">
       <section className="top-bar">
-        <div>
-          <h1>屏幕截图诊断工具</h1>
-          <p>验证显示器级截图能力，并为后续识别流程保存基础校准区域。</p>
-        </div>
-        <div className="top-actions">
-          <div className="mode-switch" aria-label="工作区">
-            <button
-              className={mode === "diagnostic" ? "selected" : ""}
-              onClick={() => setMode("diagnostic")}
-              type="button"
-            >
-              诊断
-            </button>
-            <button
-              className={mode === "calibration" ? "selected" : ""}
-              onClick={() => setMode("calibration")}
-              type="button"
-            >
-              校准
-            </button>
-            <button
-              className={mode === "overlay" ? "selected" : ""}
-              onClick={() => setMode("overlay")}
-              type="button"
-            >
-              Overlay POC
-            </button>
-            <button
-              className={mode === "ocr" ? "selected" : ""}
-              onClick={() => setMode("ocr")}
-              type="button"
-            >
-              OCR POC
-            </button>
-            <button
-              className={mode === "stateMachine" ? "selected" : ""}
-              onClick={() => setMode("stateMachine")}
-              type="button"
-            >
-              状态机 POC
-            </button>
-            <button
-              className={mode === "apex" ? "selected" : ""}
-              onClick={() => setMode("apex")}
-              type="button"
-            >
-              ApexLOL POC
-            </button>
-          </div>
-          <button
-            className="ghost-button"
-            onClick={refresh}
-            disabled={
-              loading ||
-              calibrationLoading ||
-              calibrationSaving ||
-              overlayLoading ||
-              ocrLoading ||
-              liveClientLoading ||
-              apexLoadingSlots.length > 0
-            }
-            type="button"
-          >
-            刷新环境
-          </button>
-        </div>
+        <h1>屏幕截图诊断工具</h1>
+        <button
+          className="ghost-button"
+          onClick={refresh}
+          disabled={
+            loading ||
+            calibrationLoading ||
+            calibrationSaving ||
+            overlayLoading ||
+            ocrLoading ||
+            liveClientLoading ||
+            apexLoadingSlots.length > 0
+          }
+          type="button"
+        >
+          刷新环境
+        </button>
       </section>
+      <nav className="mode-nav" aria-label="工作区">
+        <button
+          className={mode === "diagnostic" ? "selected" : ""}
+          onClick={() => setMode("diagnostic")}
+          type="button"
+        >
+          诊断
+        </button>
+        <button
+          className={mode === "calibration" ? "selected" : ""}
+          onClick={() => setMode("calibration")}
+          type="button"
+        >
+          校准
+        </button>
+        <button
+          className={mode === "overlay" ? "selected" : ""}
+          onClick={() => setMode("overlay")}
+          type="button"
+        >
+          Overlay POC
+        </button>
+        <button
+          className={mode === "ocr" ? "selected" : ""}
+          onClick={() => setMode("ocr")}
+          type="button"
+        >
+          OCR POC
+        </button>
+        <button
+          className={mode === "stateMachine" ? "selected" : ""}
+          onClick={() => setMode("stateMachine")}
+          type="button"
+        >
+          状态机 POC
+        </button>
+        <button
+          className={mode === "apex" ? "selected" : ""}
+          onClick={() => setMode("apex")}
+          type="button"
+        >
+          ApexLOL POC
+        </button>
+      </nav>
 
       {error ? <div className="error-strip">{error}</div> : null}
 

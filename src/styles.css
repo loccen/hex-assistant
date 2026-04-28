@@ -30,10 +30,37 @@ select {
 
 .top-bar {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  margin-bottom: 20px;
+  gap: 16px;
+  margin-bottom: 10px;
+}
+
+.mode-nav {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 16px;
+  padding: 3px;
+  background: #e7ebe3;
+  border: 1px solid #cfd5cc;
+  border-radius: 8px;
+}
+
+.mode-nav button {
+  flex: 1;
+  min-height: 34px;
+  padding: 0 12px;
+  color: #475049;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.mode-nav button.selected {
+  color: #ffffff;
+  background: #2f6f57;
 }
 
 h1,
@@ -52,7 +79,6 @@ h2 {
   line-height: 1.35;
 }
 
-.top-bar p,
 .empty-state p,
 .report-header p,
 .muted {
@@ -232,35 +258,6 @@ button:disabled {
   display: grid;
   gap: 18px;
   min-width: 0;
-}
-
-.top-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-
-.mode-switch {
-  display: inline-flex;
-  padding: 3px;
-  background: #e7ebe3;
-  border: 1px solid #cfd5cc;
-  border-radius: 8px;
-}
-
-.mode-switch button {
-  min-height: 34px;
-  padding: 0 14px;
-  color: #475049;
-  background: transparent;
-  border: 0;
-  border-radius: 6px;
-  cursor: pointer;
-}
-
-.mode-switch button.selected {
-  color: #ffffff;
-  background: #2f6f57;
 }
 
 .button-stack {
@@ -1117,8 +1114,7 @@ dd {
 
   .top-bar,
   .report-header,
-  .calibration-header,
-  .top-actions {
+  .calibration-header {
     flex-direction: column;
   }
 
@@ -1136,12 +1132,6 @@ dd {
   .apex-result-list,
   .profile-region-grid {
     grid-template-columns: 1fr;
-  }
-
-  .top-actions,
-  .mode-switch,
-  .mode-switch button {
-    width: 100%;
   }
 
   .calibration-actions {

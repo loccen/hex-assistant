@@ -30,3 +30,4 @@ dirs-next = "2"
 
 [target.'cfg(windows)'.dependencies]
 xcap = "0.9.4"
+raw-window-handle = "0.6"

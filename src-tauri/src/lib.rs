@@ -18,6 +18,8 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 const OVERLAY_POC_LABEL: &str = "overlay-poc";
 const OVERLAY_POC_URL: &str = "index.html?view=overlay";
+// 编译期注入构建时间，每条 overlay 日志都带上，避免误以为运行的是新版
+const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP");
 const LIVE_CLIENT_ACTIVE_PLAYER_URL: &str = "https://127.0.0.1:2999/liveclientdata/activeplayer";
 const LIVE_CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_millis(1000);
 const APEX_LOL_BASE_URL: &str = "https://apexlol.info";
@@ -611,18 +613,51 @@ fn load_calibration_profile(app: AppHandle) -> Result<Option<CalibrationProfile>
     read_calibration_profile(&app)
 }
 
+// 改 async 是为了把命令处理调度到 tokio worker 线程，
+// 而不是阻塞 Tauri 主线程消息循环。WebView2 controller 通过 COM 在主线程异步初始化，
+// 如果主线程被同步阻塞，build() 会永远等不到 controller ready，造成死锁。
 #[tauri::command]
-fn open_overlay_poc(
+async fn open_overlay_poc(
     app: AppHandle,
     request: OverlayPocRequest,
 ) -> Result<OverlayPocResult, String> {
+    overlay_debug_log(
+        &app,
+        &format!(
+            "[open_overlay_poc] build={} click_through={} cards={}",
+            BUILD_TIMESTAMP,
+            request.click_through,
+            request.cards.len()
+        ),
+    );
     let mut messages = Vec::new();
-    let profile = read_calibration_profile(&app)?;
-    let target = resolve_overlay_target(&app, &request, profile.as_ref(), &mut messages)?;
-    let cards = resolve_overlay_cards(&request, profile.as_ref(), &target, &mut messages)?;
+    let profile = match read_calibration_profile(&app) {
+        Ok(p) => p,
+        Err(err) => {
+            overlay_debug_log(&app, &format!("  read_calibration_profile FAILED: {}", err));
+            return Err(err);
+        }
+    };
+    let target = match resolve_overlay_target(&app, &request, profile.as_ref(), &mut messages) {
+        Ok(t) => t,
+        Err(err) => {
+            overlay_debug_log(&app, &format!("  resolve_overlay_target FAILED: {}", err));
+            return Err(err);
+        }
+    };
+    let cards = match resolve_overlay_cards(&request, profile.as_ref(), &target, &mut messages) {
+        Ok(c) => c,
+        Err(err) => {
+            overlay_debug_log(&app, &format!("  resolve_overlay_cards FAILED: {}", err));
+            return Err(err);
+        }
+    };
 
     if let Some(existing) = app.get_webview_window(OVERLAY_POC_LABEL) {
-        existing.close().map_err(|err| err.to_string())?;
+        if let Err(err) = existing.close() {
+            overlay_debug_log(&app, &format!("  existing.close() FAILED: {}", err));
+            return Err(err.to_string());
+        }
         messages.push("已关闭旧的 Overlay POC 窗口后重新创建。".to_string());
     }
 
@@ -641,14 +676,26 @@ fn open_overlay_poc(
         f64::from(target.logical_bounds.height),
     )
     .decorations(false)
+    .resizable(false)
     .always_on_top(true)
     .focused(false)
     .focusable(false)
-    .skip_taskbar(true);
+    .skip_taskbar(true)
+    // 先隐藏，避免窗口在初始位置（屏幕 (0,0)）短暂显示后又被 SetWindowPos 移动到 (-9,-1) 时
+    // DWM 给这个移动加平滑过渡动画，过渡帧会出现白边。
+    // 等 align_overlay_to_screen 把位置摆好后再 show()，用户看到的就是终态。
+    .visible(false);
 
+    // builder 链上同时设置 transparent + background_color：
+    // background_color 控制 WebView2 controller 的 DefaultBackgroundColor，
+    // 必须在 controller 创建前就告诉 wry，否则 build 后调 set_background_color 不会重绘默认背景。
+    // 之前担心 builder 链上调 background_color 会死锁——那是 sync fn open_overlay_poc 阻塞主线程导致的，
+    // 改成 async fn 后主线程能继续处理 WebView2 COM 消息，已不会死锁。
     #[cfg(not(target_os = "macos"))]
     {
-        builder = builder.transparent(true);
+        builder = builder
+            .transparent(true)
+            .background_color(tauri::window::Color(0, 0, 0, 0));
     }
     #[cfg(target_os = "macos")]
     {
@@ -656,9 +703,43 @@ fn open_overlay_poc(
     }
     let transparent_enabled = cfg!(not(target_os = "macos"));
 
-    let window = builder.build().map_err(|err| err.to_string())?;
+    let window = match builder.build() {
+        Ok(w) => w,
+        Err(err) => {
+            overlay_debug_log(&app, &format!("  builder.build() FAILED: {}", err));
+            return Err(err.to_string());
+        }
+    };
+
     if let Err(err) = window.set_focusable(false) {
+        overlay_debug_log(&app, &format!("  set_focusable FAILED: {}", err));
         messages.push(format!("设置窗口不抢焦点失败: {}", err));
+    }
+
+    #[cfg(windows)]
+    if let Some(hwnd) = window_hwnd(&window) {
+        // 只做 align_overlay_to_screen：把 outer 往左上挪到 (-nc_left, -nc_top)，
+        // 让 client 起点落到屏幕 (0, 0)，非客户区被推到屏幕外不可见。
+        // 不再改 GWL_STYLE / DWM border / child position——这些之前都引入了副作用（闪退）。
+        let align_result = align_overlay_to_screen(hwnd);
+        let outer_rect = get_window_rect(hwnd)
+            .map(|(x, y, w, h)| format!("{}x{}@{},{}", w, h, x, y))
+            .unwrap_or_else(|| "rect_unknown".to_string());
+        let child_rects = enumerate_child_rects(hwnd);
+        overlay_debug_log(
+            &app,
+            &format!(
+                "  hwnd=0x{:x} outer_after_align={} ex_style=0x{:x} align={:?}",
+                hwnd,
+                outer_rect,
+                outer_ex_style(hwnd),
+                align_result,
+            ),
+        );
+        overlay_debug_log(
+            &app,
+            &format!("  child rects (after align): [{}]", child_rects.join(", ")),
+        );
     }
 
     let click_through = if request.click_through {
@@ -669,6 +750,12 @@ fn open_overlay_poc(
         messages.push("请求未启用点击穿透。".to_string());
         false
     };
+
+    // 位置/click-through 都摆好后再显示，用户看到的就是终态，没有移动动画。
+    if let Err(err) = window.show() {
+        overlay_debug_log(&app, &format!("  window.show() FAILED: {}", err));
+        messages.push(format!("显示 Overlay 窗口失败: {}", err));
+    }
 
     Ok(OverlayPocResult {
         created: true,
@@ -686,14 +773,24 @@ fn open_overlay_poc(
 
 #[tauri::command]
 fn close_overlay_poc(app: AppHandle) -> Result<OverlayPocCloseResult, String> {
+    overlay_debug_log(&app, "[close_overlay_poc] called");
     if let Some(window) = app.get_webview_window(OVERLAY_POC_LABEL) {
-        window.close().map_err(|err| err.to_string())?;
-        Ok(OverlayPocCloseResult {
-            label: OVERLAY_POC_LABEL.to_string(),
-            closed: true,
-            message: "Overlay POC 窗口已关闭。".to_string(),
-        })
+        match window.close() {
+            Ok(()) => {
+                overlay_debug_log(&app, "  window.close() OK");
+                Ok(OverlayPocCloseResult {
+                    label: OVERLAY_POC_LABEL.to_string(),
+                    closed: true,
+                    message: "Overlay POC 窗口已关闭。".to_string(),
+                })
+            }
+            Err(err) => {
+                overlay_debug_log(&app, &format!("  window.close() FAILED: {}", err));
+                Err(err.to_string())
+            }
+        }
     } else {
+        overlay_debug_log(&app, "  overlay window not found");
         Ok(OverlayPocCloseResult {
             label: OVERLAY_POC_LABEL.to_string(),
             closed: false,
@@ -2009,28 +2106,277 @@ fn u32_to_i32_saturating(value: u32) -> i32 {
 }
 
 #[cfg(windows)]
+mod win32_ffi {
+    extern "system" {
+        pub fn GetWindowLongPtrW(hwnd: isize, n_index: i32) -> isize;
+        pub fn SetWindowLongPtrW(hwnd: isize, n_index: i32, dw_new_long: isize) -> isize;
+        pub fn EnumChildWindows(
+            hwnd_parent: isize,
+            lp_enum_func: unsafe extern "system" fn(isize, isize) -> i32,
+            l_param: isize,
+        ) -> i32;
+        pub fn IsWindow(hwnd: isize) -> i32;
+        pub fn GetClassNameW(hwnd: isize, lp_class_name: *mut u16, n_max_count: i32) -> i32;
+        pub fn SetWindowPos(
+            hwnd: isize,
+            hwnd_insert_after: isize,
+            x: i32,
+            y: i32,
+            cx: i32,
+            cy: i32,
+            u_flags: u32,
+        ) -> i32;
+        pub fn GetWindowRect(hwnd: isize, lp_rect: *mut Rect) -> i32;
+        pub fn ClientToScreen(hwnd: isize, lp_point: *mut Point) -> i32;
+    }
+    #[repr(C)]
+    pub struct Rect {
+        pub left: i32,
+        pub top: i32,
+        pub right: i32,
+        pub bottom: i32,
+    }
+    #[repr(C)]
+    pub struct Point {
+        pub x: i32,
+        pub y: i32,
+    }
+    pub const GWL_EXSTYLE: i32 = -20;
+    pub const WS_EX_TRANSPARENT: isize = 0x00000020;
+    pub const SWP_NOZORDER: u32 = 0x0004;
+    pub const SWP_NOACTIVATE: u32 = 0x0010;
+}
+
+// wry 的 wndproc 在 WM_NCCALCSIZE 里强制返回了 (9, 1) 的非客户区偏移，
+// 即使我们 reset GWL_STYLE 为 WS_POPUP，client 起点仍然在 outer 内 (9, 1)。
+// 子窗口在父 client (0, 0) = 屏幕 (9, 1)，导致 outer 左 9px / 顶 1px 露出父窗口默认背景。
+// 解决：把整个 outer 窗口往左上挪 (-non_client_offset)，
+// 使 client 起点落到屏幕 (0, 0)，outer 多出来的非客户区被推到屏幕外不可见。
+#[cfg(windows)]
+fn align_overlay_to_screen(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    let mut outer = win32_ffi::Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let mut origin = win32_ffi::Point { x: 0, y: 0 };
+    unsafe {
+        if win32_ffi::GetWindowRect(hwnd, &mut outer) == 0 {
+            return None;
+        }
+        if win32_ffi::ClientToScreen(hwnd, &mut origin) == 0 {
+            return None;
+        }
+        let nc_left = origin.x - outer.left;
+        let nc_top = origin.y - outer.top;
+        let new_x = outer.left - nc_left;
+        let new_y = outer.top - nc_top;
+        let outer_w = outer.right - outer.left;
+        let outer_h = outer.bottom - outer.top;
+        win32_ffi::SetWindowPos(
+            hwnd,
+            0,
+            new_x,
+            new_y,
+            outer_w,
+            outer_h,
+            win32_ffi::SWP_NOZORDER | win32_ffi::SWP_NOACTIVATE,
+        );
+        Some((new_x, new_y, nc_left, nc_top))
+    }
+}
+
+
+#[cfg(windows)]
+fn get_class_name(hwnd: isize) -> String {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; 256];
+    let len = unsafe { win32_ffi::GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if len <= 0 {
+        return String::new();
+    }
+    std::ffi::OsString::from_wide(&buf[..len as usize])
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn make_child_transparent(child_hwnd: isize, lparam: isize) -> i32 {
+    let collector = unsafe { &mut *(lparam as *mut Vec<String>) };
+    let style = unsafe { win32_ffi::GetWindowLongPtrW(child_hwnd, win32_ffi::GWL_EXSTYLE) };
+    unsafe {
+        win32_ffi::SetWindowLongPtrW(
+            child_hwnd,
+            win32_ffi::GWL_EXSTYLE,
+            style | win32_ffi::WS_EX_TRANSPARENT,
+        );
+    }
+    collector.push(get_class_name(child_hwnd));
+    1
+}
+
+#[cfg(windows)]
+fn get_window_rect(hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+    let mut rect = win32_ffi::Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    let ok = unsafe { win32_ffi::GetWindowRect(hwnd, &mut rect as *mut _) };
+    if ok != 0 {
+        Some((rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top))
+    } else {
+        None
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn collect_child_rects(child_hwnd: isize, lparam: isize) -> i32 {
+    let collector = unsafe { &mut *(lparam as *mut Vec<String>) };
+    let class_name = get_class_name(child_hwnd);
+    let rect = get_window_rect(child_hwnd)
+        .map(|(x, y, w, h)| format!("{}x{}@{},{}", w, h, x, y))
+        .unwrap_or_else(|| "rect_unknown".to_string());
+    collector.push(format!("{}({})", class_name, rect));
+    1
+}
+
+#[cfg(windows)]
+fn enumerate_child_rects(hwnd: isize) -> Vec<String> {
+    let mut collector: Vec<String> = Vec::new();
+    let lparam = (&mut collector as *mut Vec<String>) as isize;
+    unsafe {
+        win32_ffi::EnumChildWindows(hwnd, collect_child_rects, lparam);
+    }
+    collector
+}
+
+#[cfg(windows)]
+fn window_hwnd(window: &tauri::WebviewWindow) -> Option<isize> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle().ok()?;
+    let RawWindowHandle::Win32(h) = handle.as_raw() else {
+        return None;
+    };
+    Some(h.hwnd.get() as isize)
+}
+
+#[cfg(windows)]
+fn enumerate_children_transparent(hwnd: isize) -> Vec<String> {
+    let mut collector: Vec<String> = Vec::new();
+    let lparam = (&mut collector as *mut Vec<String>) as isize;
+    unsafe {
+        win32_ffi::EnumChildWindows(hwnd, make_child_transparent, lparam);
+    }
+    collector
+}
+
+#[cfg(windows)]
+fn outer_ex_style(hwnd: isize) -> isize {
+    unsafe { win32_ffi::GetWindowLongPtrW(hwnd, win32_ffi::GWL_EXSTYLE) }
+}
+
+fn overlay_debug_log_path(app: &AppHandle) -> Option<PathBuf> {
+    app_data_dir(app).ok().map(|d| d.join("overlay-debug.log"))
+}
+
+fn overlay_debug_log(app: &AppHandle, line: &str) {
+    let Some(path) = overlay_debug_log_path(app) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let mut file = match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let timestamp = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let _ = writeln!(file, "[{}] {}", timestamp, line);
+}
+
+#[cfg(windows)]
+fn is_window_alive(hwnd: isize) -> bool {
+    unsafe { win32_ffi::IsWindow(hwnd) != 0 }
+}
+
+// WebView2 host 子窗口在 build() 之后才被异步创建（CreateCoreWebView2Controller 是 COM 异步调用）。
+// 立即一次 EnumChildWindows 会漏掉那些尚未创建的子 HWND，因此后台再延时重试几轮，
+// 把后续注册进来的 WebView2 子窗口也补上 WS_EX_TRANSPARENT。
+// 每次重试前先检查 hwnd 是否还有效，避免 overlay 已关闭后还在写无意义日志。
+#[cfg(windows)]
+fn schedule_click_through_retries(app: AppHandle, hwnd: isize) {
+    std::thread::spawn(move || {
+        for delay_ms in [200u64, 700, 2000] {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            if !is_window_alive(hwnd) {
+                return;
+            }
+            let count = enumerate_children_transparent(hwnd).len();
+            overlay_debug_log(
+                &app,
+                &format!("  retry +{}ms applied to {} child(ren)", delay_ms, count),
+            );
+        }
+    });
+}
+
+#[cfg(windows)]
 fn set_overlay_click_through(
     window: &tauri::WebviewWindow,
     enabled: bool,
 ) -> OverlayPocClickThroughResult {
+    let app = window.app_handle().clone();
+    overlay_debug_log(
+        &app,
+        &format!("[set_overlay_click_through] enabled={}", enabled),
+    );
     match window.set_ignore_cursor_events(enabled) {
-        Ok(()) => OverlayPocClickThroughResult {
-            label: OVERLAY_POC_LABEL.to_string(),
-            requested: enabled,
-            applied: enabled,
-            supported: true,
-            message: format!(
-                "Windows 点击穿透已{}。",
-                if enabled { "启用" } else { "关闭" }
-            ),
-        },
-        Err(err) => OverlayPocClickThroughResult {
-            label: OVERLAY_POC_LABEL.to_string(),
-            requested: enabled,
-            applied: false,
-            supported: false,
-            message: format!("Windows 点击穿透请求失败: {}", err),
-        },
+        Ok(()) => {
+            if enabled {
+                if let Some(hwnd) = window_hwnd(window) {
+                    let info = enumerate_children_transparent(hwnd);
+                    overlay_debug_log(
+                        &app,
+                        &format!(
+                            "  outer hwnd=0x{:x} ex_style=0x{:x}, immediate applied to {} child(ren): [{}]",
+                            hwnd,
+                            outer_ex_style(hwnd),
+                            info.len(),
+                            info.join(", "),
+                        ),
+                    );
+                    schedule_click_through_retries(app.clone(), hwnd);
+                } else {
+                    overlay_debug_log(&app, "  window_hwnd returned None");
+                }
+            }
+            OverlayPocClickThroughResult {
+                label: OVERLAY_POC_LABEL.to_string(),
+                requested: enabled,
+                applied: enabled,
+                supported: true,
+                message: format!(
+                    "Windows 点击穿透已{}。",
+                    if enabled { "启用" } else { "关闭" }
+                ),
+            }
+        }
+        Err(err) => {
+            overlay_debug_log(
+                &app,
+                &format!("  set_ignore_cursor_events FAILED: {}", err),
+            );
+            OverlayPocClickThroughResult {
+                label: OVERLAY_POC_LABEL.to_string(),
+                requested: enabled,
+                applied: false,
+                supported: false,
+                message: format!("Windows 点击穿透请求失败: {}", err),
+            }
+        }
     }
 }
 
